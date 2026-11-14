@@ -25,9 +25,6 @@ const LOGIN_URL = "https://dashboard.katabump.com/auth/login";
 const DASHBOARD_URL = "https://dashboard.katabump.com/dashboard";
 const LOGOUT_URL = "https://dashboard.katabump.com/auth/logout";
 
-const TURNSTILE_FIND_ATTEMPTS = 8;
-const TURNSTILE_FIND_DELAY_MS = 1500;
-const TURNSTILE_SUCCESS_POLLS = 8;
 const RENEW_ATTEMPTS = 20;
 
 const HTTP_PROXY = process.env.HTTP_PROXY;
@@ -57,45 +54,6 @@ if (HTTP_PROXY) {
     process.exit(1);
   }
 }
-
-const INJECTED_SCRIPT = `
-(function() {
-    if (window.self === window.top) return;
-
-    try {
-        const originalAttachShadow = Element.prototype.attachShadow;
-
-        Element.prototype.attachShadow = function(init) {
-            const shadowRoot = originalAttachShadow.call(this, init);
-            if (!shadowRoot) return shadowRoot;
-
-            const checkAndReport = () => {
-                const checkbox = shadowRoot.querySelector('input[type="checkbox"]');
-                if (!checkbox) return false;
-                const rect = checkbox.getBoundingClientRect();
-                if (rect.width > 0 && rect.height > 0 && window.innerWidth > 0 && window.innerHeight > 0) {
-                    window.__turnstile_data = {
-                        xRatio: (rect.left + rect.width / 2) / window.innerWidth,
-                        yRatio: (rect.top + rect.height / 2) / window.innerHeight,
-                    };
-                    return true;
-                }
-                return false;
-            };
-
-            if (!checkAndReport()) {
-                const observer = new MutationObserver(() => {
-                    if (checkAndReport()) observer.disconnect();
-                });
-                observer.observe(shadowRoot, { childList: true, subtree: true });
-            }
-            return shadowRoot;
-        };
-    } catch (e) {
-        console.error('[Injected] attachShadow hook failed:', e);
-    }
-})();
-`;
 
 async function isVisibleWithin(locator, timeoutMs) {
   try {
@@ -131,7 +89,7 @@ async function findSeeLocator(page) {
     () => page.locator("a, button").filter({ hasText: /^See$/ }),
   ]) {
     const loc = fn();
-    if ((await loc.count()) > 0) return loc;
+    if ((await loc.count().catch(() => 0)) > 0) return loc;
   }
   return page.getByRole("link", { name: "See", exact: true });
 }
@@ -139,9 +97,11 @@ async function findSeeLocator(page) {
 async function waitForDashboard(page, timeoutMs = 20000) {
   const t0 = Date.now();
   while (Date.now() - t0 < timeoutMs) {
-    if (!page.url().includes("dashboard")) return false;
+    const url = page.url();
+    if (url.includes("/auth/")) return false;
+    if (!url.includes("dashboard.katabump.com")) return false;
     const loc = await findSeeLocator(page);
-    if ((await loc.count()) > 0) return true;
+    if ((await loc.count().catch(() => 0)) > 0) return true;
     await page.waitForTimeout(500);
   }
   return false;
@@ -251,83 +211,97 @@ function getUsers() {
   }
 }
 
-async function attemptTurnstileCdp(page) {
-  const frames = page.frames();
-  for (const frame of frames) {
-    let client = null;
-    try {
-      const data = await frame
-        .evaluate(() => window.__turnstile_data)
-        .catch(() => null);
-      if (!data) continue;
-
-      console.log("   >> Found Turnstile. Ratios:", data);
-
-      const iframeElement = await frame.frameElement();
-      if (!iframeElement) continue;
-      const box = await iframeElement.boundingBox();
-      if (!box) continue;
-
-      const clickX = box.x + box.width * data.xRatio;
-      const clickY = box.y + box.height * data.yRatio;
-      console.log(
-        `   >> Click coords: (${clickX.toFixed(2)}, ${clickY.toFixed(2)})`,
-      );
-
-      client = await page.context().newCDPSession(page);
-
-      await client.send("Input.dispatchMouseEvent", {
-        type: "mousePressed",
-        x: clickX,
-        y: clickY,
-        button: "left",
-        clickCount: 1,
-      });
-      await new Promise((r) => setTimeout(r, 50 + Math.random() * 100));
-      await client.send("Input.dispatchMouseEvent", {
-        type: "mouseReleased",
-        x: clickX,
-        y: clickY,
-        button: "left",
-        clickCount: 1,
-      });
-
-      console.log("   >> CDP click sent.");
-      return true;
-    } catch {
-    } finally {
-      if (client) await client.detach().catch(() => {});
-    }
+async function cdpClick(page, x, y) {
+  const client = await page.context().newCDPSession(page);
+  try {
+    await client.send("Input.dispatchMouseEvent", {
+      type: "mouseMoved",
+      x,
+      y,
+      button: "none",
+    });
+    await new Promise((r) => setTimeout(r, 80 + Math.random() * 120));
+    await client.send("Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x,
+      y,
+      button: "left",
+      clickCount: 1,
+    });
+    await new Promise((r) => setTimeout(r, 50 + Math.random() * 100));
+    await client.send("Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x,
+      y,
+      button: "left",
+      clickCount: 1,
+    });
+  } finally {
+    await client.detach().catch(() => {});
   }
-  return false;
 }
 
-async function isTurnstileSolved(page) {
-  for (const f of page.frames()) {
-    if (!f.url().includes("cloudflare")) continue;
-    try {
-      if (
-        await f
-          .getByText("Success!", { exact: false })
-          .isVisible()
-          .catch(() => false)
-      ) {
-        return true;
-      }
-      const solved = await f
-        .evaluate(() => {
-          const widget =
-            document.querySelector('[data-testid="cf-turnstile"]') ||
-            document.querySelector(".cf-turnstile");
-          if (widget && widget.getAttribute("data-state") === "success")
-            return true;
-          return !!document.querySelector('svg[data-icon="success"]');
-        })
-        .catch(() => false);
-      if (solved) return true;
-    } catch {}
+async function getTurnstileToken(scope) {
+  const input = scope.locator('[name="cf-turnstile-response"]').first();
+  if ((await input.count().catch(() => 0)) === 0) return null;
+  const v = await input.inputValue().catch(() => "");
+  return v && v.length > 20 ? v : null;
+}
+
+async function findTurnstileIframe(scope) {
+  for (const sel of [
+    'iframe[id^="cf-chl-widget"]',
+    'iframe[src*="challenges.cloudflare.com"]',
+  ]) {
+    const loc = scope.locator(sel).first();
+    if ((await loc.count().catch(() => 0)) === 0) continue;
+    const box = await loc.boundingBox().catch(() => null);
+    if (box && box.width > 5 && box.height > 5) return { loc, box };
   }
-  return false;
+  return null;
+}
+
+async function ensureTurnstileSolved(page, scope = page) {
+  if (await getTurnstileToken(scope)) {
+    console.log("   >> Turnstile already solved.");
+    return "solved";
+  }
+
+  console.log("   >> Waiting up to 3s for auto-solve...");
+  const autoDeadline = Date.now() + 3000;
+  while (Date.now() < autoDeadline) {
+    if (await getTurnstileToken(scope)) {
+      console.log("   >> Turnstile auto-solved.");
+      return "solved";
+    }
+    await page.waitForTimeout(300);
+  }
+
+  const widget = await findTurnstileIframe(scope);
+  if (!widget) {
+    console.log("   >> Turnstile widget not visible (crashed or missing).");
+    return "no-widget";
+  }
+
+  const cx = widget.box.x + 22;
+  const cy = widget.box.y + widget.box.height / 2;
+  console.log(
+    `   >> Clicking Turnstile at (${cx.toFixed(1)}, ${cy.toFixed(1)})...`,
+  );
+  await cdpClick(page, cx, cy);
+
+  const solveDeadline = Date.now() + 15000;
+  while (Date.now() < solveDeadline) {
+    const token = await getTurnstileToken(scope);
+    if (token) {
+      console.log(`   >> Turnstile solved (${token.length}-char token).`);
+      return "solved";
+    }
+    await page.waitForTimeout(500);
+  }
+
+  console.log("   >> Turnstile did not solve after click.");
+  return "timeout";
 }
 
 async function loginToKatabump(page, user) {
@@ -356,56 +330,62 @@ async function loginToKatabump(page, user) {
       await page.locator('input[type="password"]').fill(user.password);
       await page.waitForTimeout(500);
 
-      let clicked = false;
-      for (let a = 0; a < TURNSTILE_FIND_ATTEMPTS; a++) {
-        clicked = await attemptTurnstileCdp(page);
-        if (clicked) break;
-        await page.waitForTimeout(TURNSTILE_FIND_DELAY_MS);
-      }
-      if (clicked) {
-        for (let i = 0; i < 10; i++) {
-          await page.waitForTimeout(1000);
-          if (await isTurnstileSolved(page)) {
-            console.log("   >> Turnstile solved.");
-            break;
-          }
-        }
-      } else {
-        console.log(
-          "   >> No Turnstile checkbox found (may be invisible mode). Proceeding.",
-        );
+      const tsResult = await ensureTurnstileSolved(page);
+      if (tsResult === "no-widget") {
+        console.log("   >> Widget crashed; reloading.");
+        await page.reload();
+        await page.waitForLoadState("domcontentloaded");
+        continue;
       }
 
       await page.getByRole("button", { name: "Login", exact: true }).click();
       await page.waitForLoadState("domcontentloaded").catch(() => {});
+      await page.waitForTimeout(1500);
 
-      const badCreds = await isVisibleWithin(
-        page.getByText("Incorrect password or no account"),
-        5000,
-      );
-      if (badCreds) {
-        console.error(
-          `   >> ❌ Bad credentials for ${redactUsername(user.username)}`,
-        );
+      const url = page.url();
+      if (url.includes("error=captcha")) {
+        console.log("   >> Login failed: server rejected captcha.");
         const photoDir = ensurePhotoDir();
         try {
           await page.screenshot({
             path: path.join(
               photoDir,
-              `${safeFilename(user.username)}_login_fail.png`,
+              `${safeFilename(user.username)}_login_captcha.png`,
             ),
             fullPage: true,
           });
         } catch {}
-        return false;
+        continue;
       }
 
-      if (page.url().includes("dashboard")) {
-        console.log("   >> ✅ Logged in.");
-        return true;
+      if (url.includes("/auth/login")) {
+        if (
+          await isVisibleWithin(
+            page.getByText("Incorrect password or no account"),
+            3000,
+          )
+        ) {
+          console.error(
+            `   >> Bad credentials for ${redactUsername(user.username)}`,
+          );
+          const photoDir = ensurePhotoDir();
+          try {
+            await page.screenshot({
+              path: path.join(
+                photoDir,
+                `${safeFilename(user.username)}_login_fail.png`,
+              ),
+              fullPage: true,
+            });
+          } catch {}
+          return false;
+        }
+        console.log("   >> Still on login page after submit; retrying.");
+        continue;
       }
 
-      console.log("   >> Login outcome unclear. URL:", page.url());
+      console.log("   >> Logged in.");
+      return true;
     } catch (e) {
       console.log(`   >> Login attempt error: ${e.message}`);
     }
@@ -418,7 +398,7 @@ async function renewCurrentServer(page, user, serverIndex) {
   for (let attempt = 1; attempt <= RENEW_ATTEMPTS; attempt++) {
     try {
       console.log(
-        `\n   [Server ${serverIndex}] [Attempt ${attempt}/${RENEW_ATTEMPTS}] Looking for Renew button...`,
+        `\n   [Server ${serverIndex}] [Attempt ${attempt}/${RENEW_ATTEMPTS}]`,
       );
 
       const renewBtn = page
@@ -436,20 +416,18 @@ async function renewCurrentServer(page, user, serverIndex) {
         );
         if (notYet) {
           console.log(
-            `   [Server ${serverIndex}] ⏳ Not renewable yet: ${notYet[1].trim()}`,
+            `   [Server ${serverIndex}] Not renewable yet: ${notYet[1].trim()}`,
           );
           return "not-yet";
         }
 
         if (/suspended/i.test(bodyText)) {
-          console.log(
-            `   [Server ${serverIndex}] ⚠️ Server appears SUSPENDED — manual intervention required.`,
-          );
+          console.log(`   [Server ${serverIndex}] Server appears SUSPENDED.`);
           return "suspended";
         }
 
         console.log(
-          `   [Server ${serverIndex}] ⚠️ Renew button not found. URL: ${page.url()}`,
+          `   [Server ${serverIndex}] Renew button not found. URL: ${page.url()}`,
         );
         console.log(
           `      Body preview: ${bodyText.slice(0, 200).replace(/\s+/g, " ")}`,
@@ -483,25 +461,12 @@ async function renewCurrentServer(page, user, serverIndex) {
           });
       } catch {}
 
-      console.log("   >> Checking for Turnstile...");
-      let clicked = false;
-      for (let a = 0; a < TURNSTILE_FIND_ATTEMPTS; a++) {
-        clicked = await attemptTurnstileCdp(page);
-        if (clicked) break;
-        await page.waitForTimeout(TURNSTILE_FIND_DELAY_MS);
-      }
-
-      if (clicked) {
-        console.log("   >> Waiting for Cloudflare...");
-        for (let i = 0; i < TURNSTILE_SUCCESS_POLLS; i++) {
-          await page.waitForTimeout(1000);
-          if (await isTurnstileSolved(page)) {
-            console.log("   >> Turnstile solved.");
-            break;
-          }
-        }
-      } else {
-        console.log("   >> Turnstile checkbox not found within retry budget.");
+      const tsResult = await ensureTurnstileSolved(page, modal);
+      if (tsResult === "no-widget") {
+        console.log("   >> Widget crashed in modal; reloading.");
+        await page.reload();
+        await page.waitForLoadState("domcontentloaded").catch(() => {});
+        continue;
       }
 
       const confirmBtn = modal.getByRole("button", { name: "Renew" });
@@ -521,7 +486,6 @@ async function renewCurrentServer(page, user, serverIndex) {
           ),
           fullPage: true,
         });
-        console.log("   >> 📸 Snapshot saved.");
       } catch {}
 
       console.log("   >> Clicking Renew confirm...");
@@ -544,7 +508,7 @@ async function renewCurrentServer(page, user, serverIndex) {
           const text = await notTimeLoc.innerText().catch(() => "");
           const m = text.match(/as of\s+(.*?)\s+\(/);
           console.log(
-            `   >> ⏳ Not renewable yet. ${m ? "Available: " + m[1] : ""}`,
+            `   >> Not renewable yet. ${m ? "Available: " + m[1] : ""}`,
           );
           outcome = "not-yet";
           break;
@@ -563,7 +527,7 @@ async function renewCurrentServer(page, user, serverIndex) {
 
       await page.waitForTimeout(2000);
       if (!(await modal.isVisible().catch(() => false))) {
-        console.log("   >> ✅ Modal closed. Renew succeeded.");
+        console.log("   >> Modal closed. Renew succeeded.");
         return "success";
       }
 
@@ -621,10 +585,6 @@ async function renewCurrentServer(page, user, serverIndex) {
       context.pages().length > 0 ? context.pages()[0] : await context.newPage();
     page.setDefaultTimeout(60000);
 
-    await page.goto("about:blank").catch(() => {});
-    await page.addInitScript(INJECTED_SCRIPT);
-    console.log("Injection script added.");
-
     for (let i = 0; i < users.length; i++) {
       const user = users[i];
       console.log(
@@ -635,7 +595,6 @@ async function renewCurrentServer(page, user, serverIndex) {
         if (page.isClosed()) {
           page = await context.newPage();
           page.setDefaultTimeout(60000);
-          await page.addInitScript(INJECTED_SCRIPT);
         }
 
         const ok = await loginToKatabump(page, user);
