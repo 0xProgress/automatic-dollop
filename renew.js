@@ -272,36 +272,44 @@ async function findTurnstileIframe(page, scope) {
 }
 
 async function ensureTurnstileSolved(page, scope = page) {
-  if (await getTurnstileToken(scope)) {
-    console.log("   >> Turnstile already solved (scope).");
-    return "solved";
-  }
-  if (scope !== page && (await getTurnstileToken(page))) {
-    console.log("   >> Turnstile already solved (page).");
-    return "solved";
-  }
+  const hasToken = async () =>
+    (await getTurnstileToken(scope)) ||
+    (scope !== page ? await getTurnstileToken(page) : null);
 
-  console.log("   >> Waiting up to 10s for auto-solve or widget...");
-  const autoDeadline = Date.now() + 10000;
-  let widget = null;
-  while (Date.now() < autoDeadline) {
-    if (await getTurnstileToken(scope)) {
-      console.log("   >> Turnstile auto-solved (scope).");
+  // Phase 1: let Cloudflare self-solve. Never click in this phase.
+  const widgetDeadline = Date.now() + 8000;
+  let widgetSeen = false;
+  while (Date.now() < widgetDeadline) {
+    if (await hasToken()) {
+      console.log("   >> Turnstile solved automatically.");
       return "solved";
     }
-    if (scope !== page && (await getTurnstileToken(page))) {
-      console.log("   >> Turnstile auto-solved (page).");
-      return "solved";
+    if (await findTurnstileIframe(page, scope)) {
+      widgetSeen = true;
+      break;
     }
-    widget = await findTurnstileIframe(page, scope);
-    if (widget) break;
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(250);
   }
 
-  if (!widget) {
-    console.log("   >> No widget or token appeared after 10s.");
+  if (!widgetSeen) {
+    console.log("   >> No Turnstile widget present.");
     return "no-widget";
   }
+
+  // Phase 2: widget is present. Give it time to finish evaluating.
+  console.log("   >> Widget present; waiting up to 20s for auto-solve...");
+  const solveDeadline = Date.now() + 20000;
+  while (Date.now() < solveDeadline) {
+    if (await hasToken()) {
+      console.log("   >> Turnstile auto-solved.");
+      return "solved";
+    }
+    await page.waitForTimeout(250);
+  }
+
+  // Phase 3: still unsolved after 20s. Click once, assuming a checkbox.
+  const widget = await findTurnstileIframe(page, scope);
+  if (!widget) return "no-widget";
 
   const cx = widget.box.x + 22;
   const cy = widget.box.y + widget.box.height / 2;
@@ -310,16 +318,13 @@ async function ensureTurnstileSolved(page, scope = page) {
   );
   await cdpClick(page, cx, cy);
 
-  const solveDeadline = Date.now() + 15000;
-  while (Date.now() < solveDeadline) {
-    const token =
-      (await getTurnstileToken(scope)) ||
-      (scope !== page ? await getTurnstileToken(page) : null);
-    if (token) {
-      console.log(`   >> Turnstile solved (${token.length}-char token).`);
+  const clickDeadline = Date.now() + 15000;
+  while (Date.now() < clickDeadline) {
+    if (await hasToken()) {
+      console.log("   >> Turnstile solved after click.");
       return "solved";
     }
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(250);
   }
 
   console.log("   >> Turnstile did not solve after click.");
@@ -354,7 +359,7 @@ async function loginToKatabump(page, user) {
 
       const tsResult = await ensureTurnstileSolved(page);
       if (tsResult === "no-widget") {
-        console.log("   >> Widget crashed; reloading.");
+        console.log("   >> Widget not found; reloading.");
         await page.reload();
         await page.waitForLoadState("domcontentloaded");
         continue;
@@ -484,47 +489,24 @@ async function renewCurrentServer(page, user, serverIndex) {
       } catch {}
 
       const tsResult = await ensureTurnstileSolved(page, modal);
+      if (tsResult === "timeout") {
+        console.log("   >> Turnstile failed in modal. Reloading...");
+        await page.reload();
+        await page.waitForLoadState("domcontentloaded").catch(() => {});
+        continue;
+      }
       if (tsResult === "no-widget") {
         const modalCfDiv = await modal
           .locator(".cf-turnstile")
-          .count()
-          .catch(() => 0);
-        const modalToken = await modal
-          .locator('[name="cf-turnstile-response"]')
-          .count()
-          .catch(() => 0);
-        const pageToken = await page
-          .locator('[name="cf-turnstile-response"]')
           .count()
           .catch(() => 0);
         const modalIframes = await modal
           .locator("iframe")
           .count()
           .catch(() => 0);
-        const pageIframes = await page
-          .locator("iframe")
-          .count()
-          .catch(() => 0);
-        const modalHtml = await modal.innerHTML().catch(() => "");
         console.log(
-          `   >> Modal diag: cf-turnstile=${modalCfDiv} modal-token=${modalToken} page-token=${pageToken} modal-iframes=${modalIframes} page-iframes=${pageIframes}`,
+          `   >> No Turnstile in modal (cf-turnstile=${modalCfDiv} iframes=${modalIframes}). Trying Confirm directly.`,
         );
-        console.log(
-          `   >> Modal HTML (first 400): ${modalHtml.slice(0, 400).replace(/\s+/g, " ")}`,
-        );
-        const photoDir = ensurePhotoDir();
-        try {
-          await page.screenshot({
-            path: path.join(
-              photoDir,
-              `${safeFilename(user.username)}_server${serverIndex}_nowidget_${attempt}.png`,
-            ),
-            fullPage: true,
-          });
-        } catch {}
-        await page.reload();
-        await page.waitForLoadState("domcontentloaded").catch(() => {});
-        continue;
       }
 
       const confirmBtn = modal.getByRole("button", { name: "Renew" });
