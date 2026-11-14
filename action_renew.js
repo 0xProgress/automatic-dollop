@@ -165,6 +165,29 @@ function ensureScreenshotDir() {
   return SCREENSHOT_DIR;
 }
 
+async function findSeeLocator(page) {
+  for (const fn of [
+    () => page.getByRole("link", { name: "See", exact: true }),
+    () => page.getByRole("button", { name: "See", exact: true }),
+    () => page.locator("a, button").filter({ hasText: /^See$/ }),
+  ]) {
+    const loc = fn();
+    if ((await loc.count()) > 0) return loc;
+  }
+  return page.getByRole("link", { name: "See", exact: true });
+}
+
+async function waitForDashboard(page, timeoutMs = 20000) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < timeoutMs) {
+    if (!page.url().includes("dashboard")) return false;
+    const loc = await findSeeLocator(page);
+    if ((await loc.count()) > 0) return true;
+    await page.waitForTimeout(500);
+  }
+  return false;
+}
+
 async function checkProxy() {
   if (!PROXY_CONFIG) return true;
   console.log("[Proxy] Validating...");
@@ -704,30 +727,38 @@ async function renewCurrentServer(page, user, serverIndex) {
           continue;
         }
 
-        await page.waitForLoadState("domcontentloaded");
-        const serverCount = await page
-          .getByRole("link", { name: "See" })
-          .count();
+        await page.waitForLoadState("domcontentloaded").catch(() => {});
+        const ready = await waitForDashboard(page);
 
-        if (serverCount === 0) {
-          console.log("No servers on this account.");
+        if (!ready) {
+          const body = await page.locator("body").innerText().catch(() => "");
+          console.log("No servers detected. URL:", page.url());
+          console.log(
+            "Body preview:",
+            body.slice(0, 400).replace(/\s+/g, " "),
+          );
           summary.push({
             user: redactUsername(user.username),
             result: "no-servers",
           });
           continue;
         }
+
+        const seeLinks = await findSeeLocator(page);
+        const serverCount = await seeLinks.count();
         console.log(`Found ${serverCount} server(s).`);
 
         const serverResults = [];
         for (let s = 0; s < serverCount; s++) {
           if (s > 0) {
             await page.goto(DASHBOARD_URL);
-            await page.waitForLoadState("domcontentloaded");
+            await page.waitForLoadState("domcontentloaded").catch(() => {});
+            await waitForDashboard(page);
           }
           try {
-            await page.getByRole("link", { name: "See" }).nth(s).click();
-            await page.waitForLoadState("domcontentloaded");
+            const fresh = await findSeeLocator(page);
+            await fresh.nth(s).click();
+            await page.waitForLoadState("domcontentloaded").catch(() => {});
             await page.waitForTimeout(1000);
           } catch (e) {
             console.log(`   Could not open server ${s + 1}: ${e.message}`);
@@ -750,17 +781,19 @@ async function renewCurrentServer(page, user, serverIndex) {
           user: redactUsername(user.username),
           result: `error:${err.message}`,
         });
+      } finally {
+        try {
+          if (page && !page.isClosed()) {
+            await page.screenshot({
+              path: path.join(
+                ensureScreenshotDir(),
+                `${safeFilename(user.username)}_final.png`,
+              ),
+              fullPage: true,
+            });
+          }
+        } catch {}
       }
-
-      try {
-        await page.screenshot({
-          path: path.join(
-            ensureScreenshotDir(),
-            `${safeFilename(user.username)}_final.png`,
-          ),
-          fullPage: true,
-        });
-      } catch {}
     }
 
     const hasFailure = summary.some((r) => !/success|not-yet/.test(r.result));
@@ -775,6 +808,10 @@ async function renewCurrentServer(page, user, serverIndex) {
 
     console.log("\nAll users processed.");
   } finally {
-    if (browser) await browser.disconnect().catch(() => {});
+    if (browser) {
+      try {
+        if (typeof browser.close === "function") await browser.close();
+      } catch {}
+    }
   }
 })();
