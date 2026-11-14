@@ -242,44 +242,64 @@ async function cdpClick(page, x, y) {
 }
 
 async function getTurnstileToken(scope) {
-  const input = scope.locator('[name="cf-turnstile-response"]').first();
-  if ((await input.count().catch(() => 0)) === 0) return null;
-  const v = await input.inputValue().catch(() => "");
-  return v && v.length > 20 ? v : null;
+  const inputs = scope.locator('[name="cf-turnstile-response"]');
+  const n = await inputs.count().catch(() => 0);
+  for (let i = 0; i < n; i++) {
+    const v = await inputs
+      .nth(i)
+      .inputValue()
+      .catch(() => "");
+    if (v && v.length > 20) return v;
+  }
+  return null;
 }
 
-async function findTurnstileIframe(scope) {
-  for (const sel of [
+async function findTurnstileIframe(page, scope) {
+  const scopes = scope && scope !== page ? [scope, page] : [page];
+  const sels = [
     'iframe[id^="cf-chl-widget"]',
     'iframe[src*="challenges.cloudflare.com"]',
-  ]) {
-    const loc = scope.locator(sel).first();
-    if ((await loc.count().catch(() => 0)) === 0) continue;
-    const box = await loc.boundingBox().catch(() => null);
-    if (box && box.width > 5 && box.height > 5) return { loc, box };
+  ];
+  for (const s of scopes) {
+    for (const sel of sels) {
+      const loc = s.locator(sel).first();
+      if ((await loc.count().catch(() => 0)) === 0) continue;
+      const box = await loc.boundingBox().catch(() => null);
+      if (box && box.width > 5 && box.height > 5) return { loc, box };
+    }
   }
   return null;
 }
 
 async function ensureTurnstileSolved(page, scope = page) {
   if (await getTurnstileToken(scope)) {
-    console.log("   >> Turnstile already solved.");
+    console.log("   >> Turnstile already solved (scope).");
+    return "solved";
+  }
+  if (scope !== page && (await getTurnstileToken(page))) {
+    console.log("   >> Turnstile already solved (page).");
     return "solved";
   }
 
-  console.log("   >> Waiting up to 3s for auto-solve...");
-  const autoDeadline = Date.now() + 3000;
+  console.log("   >> Waiting up to 10s for auto-solve or widget...");
+  const autoDeadline = Date.now() + 10000;
+  let widget = null;
   while (Date.now() < autoDeadline) {
     if (await getTurnstileToken(scope)) {
-      console.log("   >> Turnstile auto-solved.");
+      console.log("   >> Turnstile auto-solved (scope).");
       return "solved";
     }
-    await page.waitForTimeout(300);
+    if (scope !== page && (await getTurnstileToken(page))) {
+      console.log("   >> Turnstile auto-solved (page).");
+      return "solved";
+    }
+    widget = await findTurnstileIframe(page, scope);
+    if (widget) break;
+    await page.waitForTimeout(500);
   }
 
-  const widget = await findTurnstileIframe(scope);
   if (!widget) {
-    console.log("   >> Turnstile widget not visible (crashed or missing).");
+    console.log("   >> No widget or token appeared after 10s.");
     return "no-widget";
   }
 
@@ -292,7 +312,9 @@ async function ensureTurnstileSolved(page, scope = page) {
 
   const solveDeadline = Date.now() + 15000;
   while (Date.now() < solveDeadline) {
-    const token = await getTurnstileToken(scope);
+    const token =
+      (await getTurnstileToken(scope)) ||
+      (scope !== page ? await getTurnstileToken(page) : null);
     if (token) {
       console.log(`   >> Turnstile solved (${token.length}-char token).`);
       return "solved";
@@ -463,7 +485,43 @@ async function renewCurrentServer(page, user, serverIndex) {
 
       const tsResult = await ensureTurnstileSolved(page, modal);
       if (tsResult === "no-widget") {
-        console.log("   >> Widget crashed in modal; reloading.");
+        const modalCfDiv = await modal
+          .locator(".cf-turnstile")
+          .count()
+          .catch(() => 0);
+        const modalToken = await modal
+          .locator('[name="cf-turnstile-response"]')
+          .count()
+          .catch(() => 0);
+        const pageToken = await page
+          .locator('[name="cf-turnstile-response"]')
+          .count()
+          .catch(() => 0);
+        const modalIframes = await modal
+          .locator("iframe")
+          .count()
+          .catch(() => 0);
+        const pageIframes = await page
+          .locator("iframe")
+          .count()
+          .catch(() => 0);
+        const modalHtml = await modal.innerHTML().catch(() => "");
+        console.log(
+          `   >> Modal diag: cf-turnstile=${modalCfDiv} modal-token=${modalToken} page-token=${pageToken} modal-iframes=${modalIframes} page-iframes=${pageIframes}`,
+        );
+        console.log(
+          `   >> Modal HTML (first 400): ${modalHtml.slice(0, 400).replace(/\s+/g, " ")}`,
+        );
+        const photoDir = ensurePhotoDir();
+        try {
+          await page.screenshot({
+            path: path.join(
+              photoDir,
+              `${safeFilename(user.username)}_server${serverIndex}_nowidget_${attempt}.png`,
+            ),
+            fullPage: true,
+          });
+        } catch {}
         await page.reload();
         await page.waitForLoadState("domcontentloaded").catch(() => {});
         continue;
