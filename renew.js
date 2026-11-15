@@ -17,6 +17,7 @@ const https = require("https");
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const CHROME_PATH =
+  process.env.CHROME_PATH ||
   "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const DEBUG_PORT = 9222;
 const USER_DATA_DIR = path.join(__dirname, "ChromeData_Katabump");
@@ -26,6 +27,8 @@ const LOGOUT_URL = "https://dashboard.katabump.com/auth/logout";
 
 const WATCHDOG_TIMEOUT_MS =
   parseInt(process.env.WATCHDOG_TIMEOUT_MS, 10) || 12 * 60 * 1000;
+
+const RENEW_OUTCOME_TIMEOUT_MS = 60000;
 
 let chromeProcess = null;
 let browser = null;
@@ -67,11 +70,10 @@ function safeFilename(s) {
   return String(s).replace(/[^a-zA-Z0-9@._-]/g, "_");
 }
 
-const SCREENSHOT_DIR = path.join(__dirname, "screenshots");
-function ensureScreenshotDir() {
-  if (!fs.existsSync(SCREENSHOT_DIR))
-    fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
-  return SCREENSHOT_DIR;
+const PHOTO_DIR = path.join(__dirname, "photo");
+function ensurePhotoDir() {
+  if (!fs.existsSync(PHOTO_DIR)) fs.mkdirSync(PHOTO_DIR, { recursive: true });
+  return PHOTO_DIR;
 }
 
 function sendTelegramMessageSync(text) {
@@ -137,6 +139,9 @@ if (HTTP_PROXY) {
     const u = new URL(HTTP_PROXY);
     PROXY_CONFIG = {
       server: `${u.protocol}//${u.hostname}:${u.port}`,
+      serverWithAuth: u.username
+        ? `${u.protocol}//${encodeURIComponent(decodeURIComponent(u.username))}:${encodeURIComponent(decodeURIComponent(u.password))}@${u.hostname}:${u.port}`
+        : `${u.protocol}//${u.hostname}:${u.port}`,
       username: u.username ? decodeURIComponent(u.username) : undefined,
       password: u.password ? decodeURIComponent(u.password) : undefined,
     };
@@ -182,6 +187,31 @@ async function waitForDashboard(page, timeoutMs = 20000) {
     await page.waitForTimeout(500);
   }
   return false;
+}
+
+async function detectAuthState(page) {
+  const url = page.url();
+  if (url.includes("/auth/login")) return "login-page";
+  if (url.includes("/auth/logout")) return "logout-page";
+  if (!url.includes("dashboard.katabump.com")) return "off-site";
+  const pwdField = page.locator('input[type="password"]');
+  const hasLoginForm =
+    (await pwdField.count().catch(() => 0)) > 0 &&
+    (await pwdField
+      .first()
+      .isVisible()
+      .catch(() => false));
+  if (hasLoginForm) return "login-page";
+  const markers = await page
+    .getByText("Your servers")
+    .count()
+    .catch(() => 0);
+  const seeLinks = await page
+    .getByRole("link", { name: "See", exact: true })
+    .count()
+    .catch(() => 0);
+  if (markers > 0 || seeLinks > 0) return "dashboard";
+  return "unknown";
 }
 
 async function checkProxy() {
@@ -244,8 +274,7 @@ async function launchChrome() {
     "--disable-background-networking",
   ];
   if (PROXY_CONFIG) {
-    args.push(`--proxy-server=${PROXY_CONFIG.server}`);
-    args.push("--proxy-bypass-list=<-loopback>");
+    args.push(`--proxy-server=${PROXY_CONFIG.serverWithAuth}`);
   }
   chromeProcess = spawn(CHROME_PATH, args, { detached: true, stdio: "ignore" });
   chromeProcess.unref();
@@ -401,7 +430,25 @@ async function ensureTurnstileSolved(
   return "timeout";
 }
 
-async function loginToKatabump(page, user) {
+async function loginToKatabump(page, user, isOnlyUser = false) {
+  log(undefined, "Probing /dashboard for existing session...");
+  await page.goto(DASHBOARD_URL, { timeout: 15000 }).catch(() => {});
+  await page
+    .waitForLoadState("domcontentloaded", { timeout: 15000 })
+    .catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const probeState = await detectAuthState(page);
+  log(undefined, `Auth probe: ${probeState}`);
+
+  if (probeState === "dashboard") {
+    if (isOnlyUser) {
+      log(undefined, "Session valid (single user); reusing login.");
+      return { status: "ok", reused: true };
+    }
+    log(undefined, "Session exists but multiple users; logging out first");
+  }
+
   for (let attempt = 1; attempt <= 2; attempt++) {
     log(
       undefined,
@@ -472,7 +519,7 @@ async function loginToKatabump(page, user) {
       }
 
       log(undefined, "Logged in successfully.");
-      return { status: "ok" };
+      return { status: "ok", reused: false };
     } catch (e) {
       log(undefined, `Login attempt error: ${e.message}`);
     }
@@ -480,13 +527,50 @@ async function loginToKatabump(page, user) {
   return { status: "failed" };
 }
 
+async function waitForRenewOutcome(page, modal, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const modalVisible = await modal
+      .isVisible({ timeout: 500 })
+      .catch(() => false);
+    if (!modalVisible) {
+      return { status: "success", elapsed: Date.now() - start };
+    }
+
+    const body = await page
+      .locator("body")
+      .innerText()
+      .catch(() => "");
+    const notYetMatch = body.match(
+      /You can't renew your server yet\.\s*You will be able to as of\s+([^(]+)/i,
+    );
+    if (notYetMatch) {
+      return {
+        status: "not-yet",
+        date: notYetMatch[1].trim(),
+        elapsed: Date.now() - start,
+      };
+    }
+    if (/please complete|invalid.*captcha/i.test(body)) {
+      return { status: "captcha", elapsed: Date.now() - start };
+    }
+    if (/incorrect/i.test(body)) {
+      return { status: "altcha-rejected", elapsed: Date.now() - start };
+    }
+    if (/suspended/i.test(body)) {
+      return { status: "suspended", elapsed: Date.now() - start };
+    }
+
+    await page.waitForTimeout(500);
+  }
+  return { status: "timeout", elapsed: timeoutMs };
+}
+
 async function renewCurrentServer(page, user, serverIndex) {
   let attempts = 0;
   const maxAttempts = 3;
   let modalRetries = 0;
   const maxModalRetries = 2;
-  let turnstileRetries = 0;
-  const maxTurnstileRetries = 2;
 
   while (attempts < maxAttempts) {
     attempts++;
@@ -514,8 +598,8 @@ async function renewCurrentServer(page, user, serverIndex) {
       .getByRole("button", { name: "Renew", exact: true })
       .first();
     if (!(await isVisibleWithin(renewBtn, 5000))) {
-      if (attempts >= 3) {
-        log(serverIndex, "Renew button missing after 3 attempts");
+      if (attempts >= maxAttempts) {
+        log(serverIndex, "Renew button missing after max attempts");
         return {
           status: "missing-renew-btn",
           url: page.url(),
@@ -543,66 +627,49 @@ async function renewCurrentServer(page, user, serverIndex) {
       continue;
     }
 
-    const tsResult = await ensureTurnstileSolved(page, modal, serverIndex);
-    if (tsResult === "timeout") {
-      turnstileRetries++;
-      if (turnstileRetries >= maxTurnstileRetries) {
-        log(serverIndex, "Turnstile timeout after max retries");
-        return { status: "turnstile-timeout", attempts };
-      }
-      log(serverIndex, "Turnstile timeout, reloading");
-      await page.reload({ timeout: 15000 }).catch(() => {});
-      continue;
-    }
-
     const confirmBtn = modal.getByRole("button", { name: "Renew" });
-    if (!(await confirmBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
+    if (!(await isVisibleWithin(confirmBtn, 5000))) {
       log(serverIndex, "Confirm button not visible, reloading");
       await page.reload({ timeout: 15000 }).catch(() => {});
       continue;
     }
 
-    log(serverIndex, "Clicking Renew confirm...");
+    log(serverIndex, "Clicking Renew confirm (ALTCHA PoW runs on submit)...");
     await confirmBtn.click({ timeout: 5000 }).catch(() => {});
 
-    let outcome = null;
-    const checkStart = Date.now();
-    while (Date.now() - checkStart < 5000) {
-      if (
-        await page
-          .getByText("Please complete the captcha to continue")
-          .isVisible({ timeout: 1000 })
-          .catch(() => false)
-      ) {
-        outcome = "captcha";
-        break;
-      }
-      const notTimeLoc = page.getByText("You can't renew your server yet");
-      if (await notTimeLoc.isVisible({ timeout: 1000 }).catch(() => false)) {
-        const text = await notTimeLoc.innerText().catch(() => "");
-        const m = text.match(/as of\s+(.*?)\s+\(/);
-        log(serverIndex, `Not renewable yet: ${m ? m[1] : ""}`);
-        outcome = "not-yet";
-        break;
-      }
-      await page.waitForTimeout(500);
-    }
+    log(
+      serverIndex,
+      `Polling outcome (up to ${RENEW_OUTCOME_TIMEOUT_MS / 1000}s for ALTCHA PoW + response)...`,
+    );
+    const outcome = await waitForRenewOutcome(
+      page,
+      modal,
+      RENEW_OUTCOME_TIMEOUT_MS,
+    );
+    log(serverIndex, `Outcome: ${outcome.status} (${outcome.elapsed}ms)`);
 
-    if (outcome === "not-yet") {
-      return { status: "not-yet", attempts };
+    if (outcome.status === "not-yet") {
+      return { status: "not-yet", date: outcome.date, attempts };
     }
-    if (outcome === "captcha") {
-      log(serverIndex, "Captcha error after confirm, reloading");
+    if (outcome.status === "suspended") {
+      return { status: "suspended", attempts };
+    }
+    if (outcome.status === "captcha" || outcome.status === "altcha-rejected") {
+      log(serverIndex, `Captcha rejected (${outcome.status}), reloading`);
       await page.reload({ timeout: 15000 }).catch(() => {});
       continue;
     }
-
-    await page.waitForTimeout(2000);
-    if (!(await modal.isVisible({ timeout: 2000 }).catch(() => false))) {
-      log(serverIndex, "Modal closed. Verifying success on dashboard...");
+    if (outcome.status === "success") {
+      log(serverIndex, "Modal closed. Verifying on dashboard...");
       await page.goto(DASHBOARD_URL, { timeout: 15000 }).catch(() => {});
-      await waitForDashboard(page, 10000);
+      await page.waitForLoadState("domcontentloaded").catch(() => {});
 
+      if (page.url().includes("/auth/")) {
+        log(serverIndex, "Session lost after renewal");
+        return { status: "session-lost", attempts };
+      }
+
+      await waitForDashboard(page, 10000);
       const dashboardBody = await page
         .locator("body")
         .innerText()
@@ -622,7 +689,7 @@ async function renewCurrentServer(page, user, serverIndex) {
       };
     }
 
-    log(serverIndex, "Modal still open, no error. Reloading...");
+    log(serverIndex, `Outcome ${outcome.status}, reloading...`);
     await page.reload({ timeout: 15000 }).catch(() => {});
   }
 
@@ -678,16 +745,7 @@ async function cleanupAndExit(code) {
       context.pages().length > 0 ? context.pages()[0] : await context.newPage();
     page.setDefaultTimeout(60000);
 
-    if (PROXY_CONFIG && PROXY_CONFIG.username) {
-      await context.setHTTPCredentials({
-        username: PROXY_CONFIG.username,
-        password: PROXY_CONFIG.password,
-      });
-    } else {
-      await context.setHTTPCredentials(null).catch(() => {});
-    }
-
-    const summary = [];
+    const isOnlyUser = users.length === 1;
     for (let i = 0; i < users.length; i++) {
       const user = users[i];
       log(
@@ -701,40 +759,27 @@ async function cleanupAndExit(code) {
           page.setDefaultTimeout(60000);
         }
 
-        const login = await loginToKatabump(page, user);
+        const login = await loginToKatabump(page, user, isOnlyUser);
         if (login.status === "bad-creds") {
           const shot = path.join(
-            ensureScreenshotDir(),
+            ensurePhotoDir(),
             `${safeFilename(user.username)}_bad_creds.png`,
           );
           await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
-          await sendTelegramMessage(
-            `❌ <b>Bad Credentials</b>\nUser: <code>${escapeHtml(user.username)}</code>\nAction: Update USERS_JSON`,
-            shot,
+          log(
+            undefined,
+            `Bad credentials for ${redactUsername(user.username)}`,
           );
-          summary.push({
-            user: redactUsername(user.username),
-            status: "bad-creds",
-            servers: [],
-          });
           finalExitCode = 1;
           continue;
         }
         if (login.status !== "ok") {
           const shot = path.join(
-            ensureScreenshotDir(),
+            ensurePhotoDir(),
             `${safeFilename(user.username)}_login_failed.png`,
           );
           await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
-          await sendTelegramMessage(
-            `❌ <b>Login Failed</b>\nUser: <code>${escapeHtml(user.username)}</code>`,
-            shot,
-          );
-          summary.push({
-            user: redactUsername(user.username),
-            status: "login-failed",
-            servers: [],
-          });
+          log(undefined, `Login failed for ${redactUsername(user.username)}`);
           finalExitCode = 1;
           continue;
         }
@@ -742,16 +787,7 @@ async function cleanupAndExit(code) {
         await page.waitForLoadState("domcontentloaded").catch(() => {});
         const ready = await waitForDashboard(page);
         if (!ready) {
-          const body = await page
-            .locator("body")
-            .innerText()
-            .catch(() => "");
           log(undefined, `No servers detected. URL: ${page.url()}`);
-          summary.push({
-            user: redactUsername(user.username),
-            status: "no-servers",
-            servers: [],
-          });
           continue;
         }
 
@@ -759,7 +795,6 @@ async function cleanupAndExit(code) {
         const serverCount = await seeLinks.count();
         log(undefined, `Found ${serverCount} server(s).`);
 
-        const serverResults = [];
         for (let s = 0; s < serverCount; s++) {
           if (s > 0) {
             await page.goto(DASHBOARD_URL, { timeout: 15000 }).catch(() => {});
@@ -774,86 +809,47 @@ async function cleanupAndExit(code) {
             await page.waitForTimeout(1000);
           } catch (e) {
             log(s + 1, `Could not open server: ${e.message}`);
-            serverResults.push({
-              index: s + 1,
-              result: "open-failed",
-              attempts: 1,
-            });
             continue;
           }
 
-          const serverBody = await page
-            .locator("body")
-            .innerText()
-            .catch(() => "");
-          const expiryMatchBefore =
-            serverBody.match(
-              /(?:expires|valid until|renewal|next billing)[:\s]+([A-Za-z0-9\s,]+)/i,
-            ) ||
-            serverBody.match(/(\d{2}\/\d{2}\/\d{4})/) ||
-            serverBody.match(/(\d{4}-\d{2}-\d{2})/);
-          const expiryBefore = expiryMatchBefore
-            ? expiryMatchBefore[0].trim()
-            : null;
-
           const result = await renewCurrentServer(page, user, s + 1);
+
+          const failureStatuses = new Set([
+            "missing-renew-btn",
+            "modal-missing",
+            "exhausted",
+            "session-lost",
+          ]);
 
           if (result.status === "suspended") {
             const shot = path.join(
-              ensureScreenshotDir(),
+              ensurePhotoDir(),
               `${safeFilename(user.username)}_s${s + 1}_suspended.png`,
             );
             await page
               .screenshot({ path: shot, fullPage: true })
               .catch(() => {});
-            await sendTelegramMessage(
-              `🚨 <b>SUSPENDED</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${s + 1} — renew manually NOW.`,
-              shot,
-            );
+            log(s + 1, "SUSPENDED — renew manually NOW");
             finalExitCode = 1;
-          } else if (
-            result.status === "captcha-exhausted" ||
-            result.status === "missing-renew-btn" ||
-            result.status === "modal-missing" ||
-            result.status === "turnstile-timeout"
-          ) {
+          } else if (failureStatuses.has(result.status)) {
             const shot = path.join(
-              ensureScreenshotDir(),
+              ensurePhotoDir(),
               `${safeFilename(user.username)}_s${s + 1}_${result.status}.png`,
             );
             await page
               .screenshot({ path: shot, fullPage: true })
               .catch(() => {});
-            await sendTelegramMessage(
-              `⚠️ <b>Server Action Failed</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${s + 1}\nReason: ${result.status}\nURL: ${result.url || "N/A"}`,
-              shot,
-            );
+            log(s + 1, `Failed: ${result.status}`);
             finalExitCode = 1;
           }
 
-          serverResults.push({
-            index: s + 1,
-            result: result.status,
-            attempts: result.attempts,
-            expiryBefore,
-            expiryAfter: result.expiry || null,
-          });
+          log(s + 1, `Result: ${result.status}`);
         }
-        summary.push({
-          user: redactUsername(user.username),
-          status: "processed",
-          servers: serverResults,
-        });
       } catch (err) {
         log(
           undefined,
           `Error processing user ${redactUsername(user.username)}: ${err.message}`,
         );
-        summary.push({
-          user: redactUsername(user.username),
-          status: `error:${err.message}`,
-          servers: [],
-        });
         finalExitCode = 1;
       } finally {
         try {
@@ -861,7 +857,7 @@ async function cleanupAndExit(code) {
             await page
               .screenshot({
                 path: path.join(
-                  ensureScreenshotDir(),
+                  ensurePhotoDir(),
                   `${safeFilename(user.username)}_final.png`,
                 ),
                 fullPage: true,
@@ -870,43 +866,12 @@ async function cleanupAndExit(code) {
           }
         } catch {}
       }
+
+      log(undefined, `Finished user ${redactUsername(user.username)}.\n`);
     }
 
     const duration = Math.round((Date.now() - startTime) / 1000);
-    let runUrl = "";
-    if (
-      process.env.GITHUB_SERVER_URL &&
-      process.env.GITHUB_REPOSITORY &&
-      process.env.GITHUB_RUN_ID
-    ) {
-      runUrl = `\nRun: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-    }
-
-    let text = `<b>KataBump Renewal Summary</b>\nDuration: ${duration}s${runUrl}\n\n`;
-    for (const userSummary of summary) {
-      text += `<b>User:</b> <code>${escapeHtml(userSummary.user)}</code>\n`;
-      if (userSummary.status === "bad-creds") {
-        text += `  Result: Bad credentials\n`;
-      } else if (userSummary.status === "login-failed") {
-        text += `  Result: Login failed\n`;
-      } else if (userSummary.status === "no-servers") {
-        text += `  Result: No servers detected\n`;
-      } else {
-        for (const srv of userSummary.servers) {
-          text += `  Server ${srv.index}: ${escapeHtml(srv.result)}`;
-          if (srv.attempts) text += ` (${srv.attempts} attempts)`;
-          if (srv.expiryBefore)
-            text += `\n    Before: ${escapeHtml(srv.expiryBefore)}`;
-          if (srv.expiryAfter)
-            text += `\n    After: ${escapeHtml(srv.expiryAfter)}`;
-          text += `\n`;
-        }
-      }
-      text += `\n`;
-    }
-
-    await sendTelegramMessage(text);
-    log(undefined, "All users processed.");
+    log(undefined, `All users processed in ${duration}s.`);
   } finally {
     await cleanupAndExit(finalExitCode);
   }

@@ -27,6 +27,8 @@ process.env.NO_PROXY = "localhost,127.0.0.1";
 const WATCHDOG_TIMEOUT_MS =
   parseInt(process.env.WATCHDOG_TIMEOUT_MS, 10) || 12 * 60 * 1000;
 
+const RENEW_OUTCOME_TIMEOUT_MS = 60000;
+
 let chromeProcess = null;
 let browser = null;
 let finalExitCode = 0;
@@ -182,6 +184,31 @@ async function waitForDashboard(page, timeoutMs = 20000) {
     await page.waitForTimeout(500);
   }
   return false;
+}
+
+async function detectAuthState(page) {
+  const url = page.url();
+  if (url.includes("/auth/login")) return "login-page";
+  if (url.includes("/auth/logout")) return "logout-page";
+  if (!url.includes("dashboard.katabump.com")) return "off-site";
+  const pwdField = page.locator('input[type="password"]');
+  const hasLoginForm =
+    (await pwdField.count().catch(() => 0)) > 0 &&
+    (await pwdField
+      .first()
+      .isVisible()
+      .catch(() => false));
+  if (hasLoginForm) return "login-page";
+  const markers = await page
+    .getByText("Your servers")
+    .count()
+    .catch(() => 0);
+  const seeLinks = await page
+    .getByRole("link", { name: "See", exact: true })
+    .count()
+    .catch(() => 0);
+  if (markers > 0 || seeLinks > 0) return "dashboard";
+  return "unknown";
 }
 
 async function checkProxy() {
@@ -405,7 +432,25 @@ async function ensureTurnstileSolved(
   return "timeout";
 }
 
-async function loginToKatabump(page, user) {
+async function loginToKatabump(page, user, isOnlyUser = false) {
+  log(undefined, "Probing /dashboard for existing session...");
+  await page.goto(DASHBOARD_URL, { timeout: 15000 }).catch(() => {});
+  await page
+    .waitForLoadState("domcontentloaded", { timeout: 15000 })
+    .catch(() => {});
+  await page.waitForTimeout(1500);
+
+  const probeState = await detectAuthState(page);
+  log(undefined, `Auth probe: ${probeState}`);
+
+  if (probeState === "dashboard") {
+    if (isOnlyUser) {
+      log(undefined, "Session valid (single user); reusing login.");
+      return { status: "ok", reused: true };
+    }
+    log(undefined, "Session exists but multiple users; logging out first");
+  }
+
   for (let attempt = 1; attempt <= 2; attempt++) {
     log(
       undefined,
@@ -476,7 +521,7 @@ async function loginToKatabump(page, user) {
       }
 
       log(undefined, "Logged in successfully.");
-      return { status: "ok" };
+      return { status: "ok", reused: false };
     } catch (e) {
       log(undefined, `Login attempt error: ${e.message}`);
     }
@@ -484,13 +529,50 @@ async function loginToKatabump(page, user) {
   return { status: "failed" };
 }
 
+async function waitForRenewOutcome(page, modal, timeoutMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const modalVisible = await modal
+      .isVisible({ timeout: 500 })
+      .catch(() => false);
+    if (!modalVisible) {
+      return { status: "success", elapsed: Date.now() - start };
+    }
+
+    const body = await page
+      .locator("body")
+      .innerText()
+      .catch(() => "");
+    const notYetMatch = body.match(
+      /You can't renew your server yet\.\s*You will be able to as of\s+([^(]+)/i,
+    );
+    if (notYetMatch) {
+      return {
+        status: "not-yet",
+        date: notYetMatch[1].trim(),
+        elapsed: Date.now() - start,
+      };
+    }
+    if (/please complete|invalid.*captcha/i.test(body)) {
+      return { status: "captcha", elapsed: Date.now() - start };
+    }
+    if (/incorrect/i.test(body)) {
+      return { status: "altcha-rejected", elapsed: Date.now() - start };
+    }
+    if (/suspended/i.test(body)) {
+      return { status: "suspended", elapsed: Date.now() - start };
+    }
+
+    await page.waitForTimeout(500);
+  }
+  return { status: "timeout", elapsed: timeoutMs };
+}
+
 async function renewCurrentServer(page, user, serverIndex) {
   let attempts = 0;
   const maxAttempts = 3;
   let modalRetries = 0;
   const maxModalRetries = 2;
-  let turnstileRetries = 0;
-  const maxTurnstileRetries = 2;
 
   while (attempts < maxAttempts) {
     attempts++;
@@ -518,8 +600,8 @@ async function renewCurrentServer(page, user, serverIndex) {
       .getByRole("button", { name: "Renew", exact: true })
       .first();
     if (!(await isVisibleWithin(renewBtn, 5000))) {
-      if (attempts >= 3) {
-        log(serverIndex, "Renew button missing after 3 attempts");
+      if (attempts >= maxAttempts) {
+        log(serverIndex, "Renew button missing after max attempts");
         return {
           status: "missing-renew-btn",
           url: page.url(),
@@ -547,66 +629,49 @@ async function renewCurrentServer(page, user, serverIndex) {
       continue;
     }
 
-    const tsResult = await ensureTurnstileSolved(page, modal, serverIndex);
-    if (tsResult === "timeout") {
-      turnstileRetries++;
-      if (turnstileRetries >= maxTurnstileRetries) {
-        log(serverIndex, "Turnstile timeout after max retries");
-        return { status: "turnstile-timeout", attempts };
-      }
-      log(serverIndex, "Turnstile timeout, reloading");
-      await page.reload({ timeout: 15000 }).catch(() => {});
-      continue;
-    }
-
     const confirmBtn = modal.getByRole("button", { name: "Renew" });
-    if (!(await confirmBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
+    if (!(await isVisibleWithin(confirmBtn, 5000))) {
       log(serverIndex, "Confirm button not visible, reloading");
       await page.reload({ timeout: 15000 }).catch(() => {});
       continue;
     }
 
-    log(serverIndex, "Clicking Renew confirm...");
+    log(serverIndex, "Clicking Renew confirm (ALTCHA PoW runs on submit)...");
     await confirmBtn.click({ timeout: 5000 }).catch(() => {});
 
-    let outcome = null;
-    const checkStart = Date.now();
-    while (Date.now() - checkStart < 5000) {
-      if (
-        await page
-          .getByText("Please complete the captcha to continue")
-          .isVisible({ timeout: 1000 })
-          .catch(() => false)
-      ) {
-        outcome = "captcha";
-        break;
-      }
-      const notTimeLoc = page.getByText("You can't renew your server yet");
-      if (await notTimeLoc.isVisible({ timeout: 1000 }).catch(() => false)) {
-        const text = await notTimeLoc.innerText().catch(() => "");
-        const m = text.match(/as of\s+(.*?)\s+\(/);
-        log(serverIndex, `Not renewable yet: ${m ? m[1] : ""}`);
-        outcome = "not-yet";
-        break;
-      }
-      await page.waitForTimeout(500);
-    }
+    log(
+      serverIndex,
+      `Polling outcome (up to ${RENEW_OUTCOME_TIMEOUT_MS / 1000}s for ALTCHA PoW + response)...`,
+    );
+    const outcome = await waitForRenewOutcome(
+      page,
+      modal,
+      RENEW_OUTCOME_TIMEOUT_MS,
+    );
+    log(serverIndex, `Outcome: ${outcome.status} (${outcome.elapsed}ms)`);
 
-    if (outcome === "not-yet") {
-      return { status: "not-yet", attempts };
+    if (outcome.status === "not-yet") {
+      return { status: "not-yet", date: outcome.date, attempts };
     }
-    if (outcome === "captcha") {
-      log(serverIndex, "Captcha error after confirm, reloading");
+    if (outcome.status === "suspended") {
+      return { status: "suspended", attempts };
+    }
+    if (outcome.status === "captcha" || outcome.status === "altcha-rejected") {
+      log(serverIndex, `Captcha rejected (${outcome.status}), reloading`);
       await page.reload({ timeout: 15000 }).catch(() => {});
       continue;
     }
-
-    await page.waitForTimeout(2000);
-    if (!(await modal.isVisible({ timeout: 2000 }).catch(() => false))) {
-      log(serverIndex, "Modal closed. Verifying success on dashboard...");
+    if (outcome.status === "success") {
+      log(serverIndex, "Modal closed. Verifying on dashboard...");
       await page.goto(DASHBOARD_URL, { timeout: 15000 }).catch(() => {});
-      await waitForDashboard(page, 10000);
+      await page.waitForLoadState("domcontentloaded").catch(() => {});
 
+      if (page.url().includes("/auth/")) {
+        log(serverIndex, "Session lost after renewal");
+        return { status: "session-lost", attempts };
+      }
+
+      await waitForDashboard(page, 10000);
       const dashboardBody = await page
         .locator("body")
         .innerText()
@@ -626,7 +691,7 @@ async function renewCurrentServer(page, user, serverIndex) {
       };
     }
 
-    log(serverIndex, "Modal still open, no error. Reloading...");
+    log(serverIndex, `Outcome ${outcome.status}, reloading...`);
     await page.reload({ timeout: 15000 }).catch(() => {});
   }
 
@@ -691,6 +756,7 @@ async function cleanupAndExit(code) {
       await context.setHTTPCredentials(null).catch(() => {});
     }
 
+    const isOnlyUser = users.length === 1;
     const summary = [];
     for (let i = 0; i < users.length; i++) {
       const user = users[i];
@@ -705,7 +771,7 @@ async function cleanupAndExit(code) {
           page.setDefaultTimeout(60000);
         }
 
-        const login = await loginToKatabump(page, user);
+        const login = await loginToKatabump(page, user, isOnlyUser);
         if (login.status === "bad-creds") {
           const shot = path.join(
             ensureScreenshotDir(),
@@ -802,6 +868,13 @@ async function cleanupAndExit(code) {
 
           const result = await renewCurrentServer(page, user, s + 1);
 
+          const failureStatuses = new Set([
+            "missing-renew-btn",
+            "modal-missing",
+            "exhausted",
+            "session-lost",
+          ]);
+
           if (result.status === "suspended") {
             const shot = path.join(
               ensureScreenshotDir(),
@@ -815,12 +888,7 @@ async function cleanupAndExit(code) {
               shot,
             );
             finalExitCode = 1;
-          } else if (
-            result.status === "captcha-exhausted" ||
-            result.status === "missing-renew-btn" ||
-            result.status === "modal-missing" ||
-            result.status === "turnstile-timeout"
-          ) {
+          } else if (failureStatuses.has(result.status)) {
             const shot = path.join(
               ensureScreenshotDir(),
               `${safeFilename(user.username)}_s${s + 1}_${result.status}.png`,
