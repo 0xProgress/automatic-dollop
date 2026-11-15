@@ -1,109 +1,58 @@
 let chromium;
 try {
   ({ chromium } = require("patchright"));
-  console.log("[Init] Using patchright");
 } catch {
   const { chromium: pwChromium } = require("playwright-extra");
   const stealth = require("puppeteer-extra-plugin-stealth")();
   pwChromium.use(stealth);
   chromium = pwChromium;
-  console.log("[Init] Using playwright-extra + stealth");
 }
-
 const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const axios = require("axios");
 const http = require("http");
+const https = require("https");
 
 const TG_BOT_TOKEN = process.env.TG_BOT_TOKEN;
 const TG_CHAT_ID = process.env.TG_CHAT_ID;
 const CHROME_PATH = process.env.CHROME_PATH || "/usr/bin/google-chrome";
 const DEBUG_PORT = 9222;
 const USER_DATA_DIR = "/tmp/chrome_user_data";
-
 const LOGIN_URL = "https://dashboard.katabump.com/auth/login";
 const DASHBOARD_URL = "https://dashboard.katabump.com/dashboard";
 const LOGOUT_URL = "https://dashboard.katabump.com/auth/logout";
-
-const RENEW_ATTEMPTS = 20;
-
 process.env.NO_PROXY = "localhost,127.0.0.1";
+
+const WATCHDOG_TIMEOUT_MS =
+  parseInt(process.env.WATCHDOG_TIMEOUT_MS, 10) || 12 * 60 * 1000;
+
+let chromeProcess = null;
+let browser = null;
+let finalExitCode = 0;
+
+const watchdogTimer = setTimeout(() => {
+  console.error(
+    `\n[${new Date().toISOString()}] [Global] Run exceeded ${WATCHDOG_TIMEOUT_MS / 1000} seconds. Forcing exit.`,
+  );
+  sendTelegramMessageSync(
+    `🚨 <b>Watchdog Timeout</b>\nThe KataBump renewal run exceeded ${WATCHDOG_TIMEOUT_MS / 1000} seconds and was forcefully terminated.`,
+  );
+  cleanupAndExit(2);
+}, WATCHDOG_TIMEOUT_MS);
+watchdogTimer.unref();
+
+function log(serverIndex, msg) {
+  const prefix =
+    serverIndex !== undefined ? `[Server ${serverIndex}]` : "[Global]";
+  console.log(`[${new Date().toISOString()}] ${prefix} ${msg}`);
+}
 
 function escapeHtml(s) {
   return String(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
-}
-
-async function sendTelegramMessage(text, imagePath = null) {
-  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
-
-  try {
-    await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        chat_id: TG_CHAT_ID,
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: true,
-      }),
-    });
-    console.log("[Telegram] Text sent.");
-  } catch (e) {
-    console.error("[Telegram] Text failed:", e.message);
-  }
-
-  if (imagePath && fs.existsSync(imagePath)) {
-    try {
-      const buf = fs.readFileSync(imagePath);
-      const form = new FormData();
-      form.append("chat_id", TG_CHAT_ID);
-      form.append(
-        "photo",
-        new Blob([buf], { type: "image/png" }),
-        path.basename(imagePath),
-      );
-      await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, {
-        method: "POST",
-        body: form,
-      });
-      console.log("[Telegram] Photo sent.");
-    } catch (e) {
-      console.error("[Telegram] Photo failed:", e.message);
-    }
-  }
-}
-
-const HTTP_PROXY = process.env.HTTP_PROXY;
-let PROXY_CONFIG = null;
-
-if (HTTP_PROXY) {
-  try {
-    const u = new URL(HTTP_PROXY);
-    PROXY_CONFIG = {
-      server: `${u.protocol}//${u.hostname}:${u.port}`,
-      username: u.username ? decodeURIComponent(u.username) : undefined,
-      password: u.password ? decodeURIComponent(u.password) : undefined,
-    };
-    console.log(
-      `[Proxy] Server=${PROXY_CONFIG.server} Auth=${PROXY_CONFIG.username ? "Yes" : "No"}`,
-    );
-  } catch {
-    console.error("[Proxy] Invalid HTTP_PROXY format.");
-    process.exit(1);
-  }
-}
-
-async function isVisibleWithin(locator, timeoutMs) {
-  try {
-    await locator.waitFor({ state: "visible", timeout: timeoutMs });
-    return true;
-  } catch {
-    return false;
-  }
 }
 
 function redactUsername(u) {
@@ -123,6 +72,91 @@ function ensureScreenshotDir() {
   if (!fs.existsSync(SCREENSHOT_DIR))
     fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
   return SCREENSHOT_DIR;
+}
+
+function sendTelegramMessageSync(text) {
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+  const data = JSON.stringify({
+    chat_id: TG_CHAT_ID,
+    text,
+    parse_mode: "HTML",
+  });
+  const options = {
+    hostname: "api.telegram.org",
+    port: 443,
+    path: `/bot${TG_BOT_TOKEN}/sendMessage`,
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": data.length,
+    },
+  };
+  const req = https.request(options, () => {});
+  req.on("error", () => {});
+  req.write(data);
+  req.end();
+}
+
+async function sendTelegramMessage(text, imagePath = null) {
+  if (!TG_BOT_TOKEN || !TG_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text,
+        parse_mode: "HTML",
+        disable_web_page_preview: true,
+      }),
+    }).catch(() => {});
+  } catch (e) {}
+
+  if (imagePath && fs.existsSync(imagePath)) {
+    try {
+      const buf = fs.readFileSync(imagePath);
+      const form = new FormData();
+      form.append("chat_id", TG_CHAT_ID);
+      form.append(
+        "photo",
+        new Blob([buf], { type: "image/png" }),
+        path.basename(imagePath),
+      );
+      await fetch(`https://api.telegram.org/bot${TG_BOT_TOKEN}/sendPhoto`, {
+        method: "POST",
+        body: form,
+      }).catch(() => {});
+    } catch (e) {}
+  }
+}
+
+const HTTP_PROXY = process.env.HTTP_PROXY;
+let PROXY_CONFIG = null;
+if (HTTP_PROXY) {
+  try {
+    const u = new URL(HTTP_PROXY);
+    PROXY_CONFIG = {
+      server: `${u.protocol}//${u.hostname}:${u.port}`,
+      username: u.username ? decodeURIComponent(u.username) : undefined,
+      password: u.password ? decodeURIComponent(u.password) : undefined,
+    };
+    log(
+      undefined,
+      `Proxy Server=${PROXY_CONFIG.server} Auth=${PROXY_CONFIG.username ? "Yes" : "No"}`,
+    );
+  } catch {
+    log(undefined, "Invalid HTTP_PROXY format.");
+    process.exit(1);
+  }
+}
+
+async function isVisibleWithin(locator, timeoutMs) {
+  try {
+    await locator.waitFor({ state: "visible", timeout: timeoutMs });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 async function findSeeLocator(page) {
@@ -152,7 +186,7 @@ async function waitForDashboard(page, timeoutMs = 20000) {
 
 async function checkProxy() {
   if (!PROXY_CONFIG) return true;
-  console.log("[Proxy] Validating...");
+  log(undefined, "Validating proxy...");
   try {
     const u = new URL(PROXY_CONFIG.server);
     const cfg = {
@@ -166,10 +200,10 @@ async function checkProxy() {
       };
     }
     await axios.get("https://www.cloudflare.com/cdn-cgi/trace", cfg);
-    console.log("[Proxy] OK");
+    log(undefined, "Proxy OK");
     return true;
   } catch (e) {
-    console.error("[Proxy] Failed:", e.message);
+    log(undefined, `Proxy Failed: ${e.message}`);
     return false;
   }
 }
@@ -188,13 +222,11 @@ async function launchChrome() {
   if (!fs.existsSync(CHROME_PATH)) {
     throw new Error(`Chrome not found at ${CHROME_PATH}`);
   }
-
   if (await checkPort(DEBUG_PORT)) {
-    console.log("Chrome already running.");
+    log(undefined, "Chrome already running.");
     return;
   }
-
-  console.log("Launching Chrome...");
+  log(undefined, "Launching Chrome...");
   const args = [
     `--remote-debugging-port=${DEBUG_PORT}`,
     "--remote-allow-origins=*",
@@ -211,22 +243,18 @@ async function launchChrome() {
     "--disable-component-update",
     "--disable-background-networking",
   ];
-
   if (PROXY_CONFIG) {
     args.push(`--proxy-server=${PROXY_CONFIG.server}`);
     args.push("--proxy-bypass-list=<-loopback>");
   }
-
-  const chrome = spawn(CHROME_PATH, args, { detached: true, stdio: "ignore" });
-  chrome.unref();
-
+  chromeProcess = spawn(CHROME_PATH, args, { detached: true, stdio: "ignore" });
+  chromeProcess.unref();
   for (let i = 0; i < 20; i++) {
     if (await checkPort(DEBUG_PORT)) return;
     await new Promise((r) => setTimeout(r, 1000));
   }
-
   try {
-    chrome.kill();
+    chromeProcess.kill("SIGKILL");
   } catch {}
   throw new Error(`Chrome failed to open CDP on port ${DEBUG_PORT}`);
 }
@@ -235,7 +263,7 @@ function getUsers() {
   try {
     const raw = process.env.USERS_JSON;
     if (!raw) {
-      console.error("USERS_JSON not set.");
+      log(undefined, "USERS_JSON not set.");
       return [];
     }
     const parsed = JSON.parse(raw);
@@ -249,13 +277,11 @@ function getUsers() {
         u.password.length > 0,
     );
     if (valid.length !== arr.length) {
-      console.warn(
-        `[Config] ${arr.length - valid.length} malformed user(s) skipped.`,
-      );
+      log(undefined, `${arr.length - valid.length} malformed user(s) skipped.`);
     }
     return valid;
   } catch (e) {
-    console.error("Error parsing USERS_JSON:", e.message);
+    log(undefined, `Error parsing USERS_JSON: ${e.message}`);
     return [];
   }
 }
@@ -320,17 +346,20 @@ async function findTurnstileIframe(page, scope) {
   return null;
 }
 
-async function ensureTurnstileSolved(page, scope = page) {
+async function ensureTurnstileSolved(
+  page,
+  scope = page,
+  serverIndex = undefined,
+) {
   const hasToken = async () =>
     (await getTurnstileToken(scope)) ||
     (scope !== page ? await getTurnstileToken(page) : null);
 
-  // Phase 1: let Cloudflare self-solve. Never click in this phase.
   const widgetDeadline = Date.now() + 8000;
   let widgetSeen = false;
   while (Date.now() < widgetDeadline) {
     if (await hasToken()) {
-      console.log("   >> Turnstile solved automatically.");
+      log(serverIndex, "Turnstile solved automatically.");
       return "solved";
     }
     if (await findTurnstileIframe(page, scope)) {
@@ -339,95 +368,93 @@ async function ensureTurnstileSolved(page, scope = page) {
     }
     await page.waitForTimeout(250);
   }
-
   if (!widgetSeen) {
-    console.log("   >> No Turnstile widget present.");
+    log(serverIndex, "No Turnstile widget present.");
     return "no-widget";
   }
 
-  // Phase 2: widget is present. Give it time to finish evaluating.
-  console.log("   >> Widget present; waiting up to 20s for auto-solve...");
+  log(serverIndex, "Widget present; waiting up to 20s for auto-solve...");
   const solveDeadline = Date.now() + 20000;
   while (Date.now() < solveDeadline) {
     if (await hasToken()) {
-      console.log("   >> Turnstile auto-solved.");
+      log(serverIndex, "Turnstile auto-solved.");
       return "solved";
     }
     await page.waitForTimeout(250);
   }
 
-  // Phase 3: still unsolved after 20s. Click once, assuming a checkbox.
   const widget = await findTurnstileIframe(page, scope);
   if (!widget) return "no-widget";
-
   const cx = widget.box.x + 22;
   const cy = widget.box.y + widget.box.height / 2;
-  console.log(
-    `   >> Clicking Turnstile at (${cx.toFixed(1)}, ${cy.toFixed(1)})...`,
+  log(
+    serverIndex,
+    `Clicking Turnstile at (${cx.toFixed(1)}, ${cy.toFixed(1)})...`,
   );
   await cdpClick(page, cx, cy);
 
   const clickDeadline = Date.now() + 15000;
   while (Date.now() < clickDeadline) {
     if (await hasToken()) {
-      console.log("   >> Turnstile solved after click.");
+      log(serverIndex, "Turnstile solved after click.");
       return "solved";
     }
     await page.waitForTimeout(250);
   }
-
-  console.log("   >> Turnstile did not solve after click.");
+  log(serverIndex, "Turnstile did not solve after click.");
   return "timeout";
 }
 
 async function loginToKatabump(page, user) {
-  for (let loginAttempt = 1; loginAttempt <= 2; loginAttempt++) {
-    console.log(`   [Login ${loginAttempt}/2]`);
-
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    log(
+      undefined,
+      `Login attempt ${attempt}/2 for ${redactUsername(user.username)}`,
+    );
     try {
       if (
         page.url().includes("dashboard") &&
         !page.url().includes("/auth/login")
       ) {
-        await page.goto(LOGOUT_URL);
-        await page.waitForLoadState("domcontentloaded");
+        await page.goto(LOGOUT_URL, { timeout: 15000 }).catch(() => {});
+        await page
+          .waitForLoadState("domcontentloaded", { timeout: 15000 })
+          .catch(() => {});
         await page.waitForTimeout(1000);
       }
-
-      await page.goto(LOGIN_URL);
-      await page.waitForLoadState("domcontentloaded");
+      await page.goto(LOGIN_URL, { timeout: 15000 });
+      await page.waitForLoadState("domcontentloaded", { timeout: 15000 });
 
       const emailInput = page.getByRole("textbox", { name: "Email" });
       if (!(await isVisibleWithin(emailInput, 10000))) {
-        console.log("   >> Login form not visible; retrying.");
+        log(undefined, "Login form not visible; retrying.");
         continue;
       }
-      await emailInput.fill(user.username);
-      await page.locator('input[type="password"]').fill(user.password);
+
+      await emailInput.fill(user.username, { timeout: 5000 });
+      await page
+        .locator('input[type="password"]')
+        .fill(user.password, { timeout: 5000 });
       await page.waitForTimeout(500);
 
-      const tsResult = await ensureTurnstileSolved(page);
+      const tsResult = await ensureTurnstileSolved(page, page, undefined);
       if (tsResult === "no-widget") {
-        console.log("   >> Widget not found; reloading.");
-        await page.reload();
-        await page.waitForLoadState("domcontentloaded");
+        log(undefined, "Widget not found; reloading.");
+        await page.reload({ timeout: 15000 }).catch(() => {});
         continue;
       }
 
-      await page.getByRole("button", { name: "Login", exact: true }).click();
-      await page.waitForLoadState("domcontentloaded").catch(() => {});
+      await page
+        .getByRole("button", { name: "Login", exact: true })
+        .click({ timeout: 5000 });
+      await page
+        .waitForLoadState("domcontentloaded", { timeout: 15000 })
+        .catch(() => {});
       await page.waitForTimeout(1500);
 
       const url = page.url();
       if (url.includes("error=captcha")) {
-        console.log("   >> Login failed: server rejected captcha.");
-        const shot = path.join(
-          ensureScreenshotDir(),
-          `${safeFilename(user.username)}_login_captcha.png`,
-        );
-        try {
-          await page.screenshot({ path: shot, fullPage: true });
-        } catch {}
+        log(undefined, "Server rejected captcha; retrying.");
         continue;
       }
 
@@ -438,272 +465,215 @@ async function loginToKatabump(page, user) {
             3000,
           )
         ) {
-          const shot = path.join(
-            ensureScreenshotDir(),
-            `${safeFilename(user.username)}_login_fail.png`,
+          log(
+            undefined,
+            `Bad credentials for ${redactUsername(user.username)}`,
           );
-          try {
-            await page.screenshot({ path: shot, fullPage: true });
-          } catch {}
-          console.error(
-            `   >> Bad credentials for ${redactUsername(user.username)}`,
-          );
-          await sendTelegramMessage(
-            `❌ <b>Login failed</b>\nUser: <code>${escapeHtml(user.username)}</code>\nReason: bad credentials`,
-            shot,
-          );
-          return "bad-creds";
+          return { status: "bad-creds" };
         }
-        console.log("   >> Still on login page after submit; retrying.");
+        log(undefined, "Still on login page after submit; retrying.");
         continue;
       }
 
-      console.log("   >> Logged in.");
-      return "ok";
+      log(undefined, "Logged in successfully.");
+      return { status: "ok" };
     } catch (e) {
-      console.log(`   >> Login attempt error: ${e.message}`);
+      log(undefined, `Login attempt error: ${e.message}`);
     }
   }
-
-  const shot = path.join(
-    ensureScreenshotDir(),
-    `${safeFilename(user.username)}_login_unclear.png`,
-  );
-  try {
-    await page.screenshot({ path: shot, fullPage: true });
-  } catch {}
-  await sendTelegramMessage(
-    `⚠️ <b>Login did not succeed</b>\nUser: <code>${escapeHtml(user.username)}</code>`,
-    shot,
-  );
-  return "failed";
+  return { status: "failed" };
 }
 
 async function renewCurrentServer(page, user, serverIndex) {
-  for (let attempt = 1; attempt <= RENEW_ATTEMPTS; attempt++) {
-    console.log(
-      `   [Server ${serverIndex}] [Attempt ${attempt}/${RENEW_ATTEMPTS}]`,
+  let attempts = 0;
+  const maxAttempts = 3;
+  let modalRetries = 0;
+  const maxModalRetries = 2;
+  let turnstileRetries = 0;
+  const maxTurnstileRetries = 2;
+
+  while (attempts < maxAttempts) {
+    attempts++;
+    log(serverIndex, `Attempt ${attempts}/${maxAttempts}`);
+
+    const bodyText = await page
+      .locator("body")
+      .innerText()
+      .catch(() => "");
+    const notYetMatch = bodyText.match(
+      /You can't renew your server yet\.\s*You will be able to as of\s+([^(]+)/,
     );
+    if (notYetMatch) {
+      const dateStr = notYetMatch[1].trim();
+      log(serverIndex, `Not renewable until ${dateStr}`);
+      return { status: "not-yet", date: dateStr, attempts };
+    }
+
+    if (/suspended/i.test(bodyText)) {
+      log(serverIndex, "Server appears SUSPENDED");
+      return { status: "suspended", attempts };
+    }
 
     const renewBtn = page
       .getByRole("button", { name: "Renew", exact: true })
       .first();
-
     if (!(await isVisibleWithin(renewBtn, 5000))) {
-      const body = await page
-        .locator("body")
-        .innerText()
-        .catch(() => "");
-
-      const notYet = body.match(
-        /You can't renew your server yet\.\s*You will be able to as of\s+([^(]+)/,
-      );
-      if (notYet) {
-        const dateStr = notYet[1].trim();
-        console.log(
-          `   [Server ${serverIndex}] Not renewable until ${dateStr}`,
-        );
-        const shot = path.join(
-          ensureScreenshotDir(),
-          `${safeFilename(user.username)}_s${serverIndex}_notyet.png`,
-        );
-        try {
-          await page.screenshot({ path: shot, fullPage: true });
-        } catch {}
-        await sendTelegramMessage(
-          `⏳ <b>Not yet renewable</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${serverIndex}\nAvailable: ${escapeHtml(dateStr)}`,
-          shot,
-        );
-        return "not-yet";
+      if (attempts >= 3) {
+        log(serverIndex, "Renew button missing after 3 attempts");
+        return {
+          status: "missing-renew-btn",
+          url: page.url(),
+          excerpt: bodyText.slice(0, 200),
+          attempts,
+        };
       }
-
-      if (/suspended/i.test(body)) {
-        console.log(`   [Server ${serverIndex}] SUSPENDED.`);
-        const shot = path.join(
-          ensureScreenshotDir(),
-          `${safeFilename(user.username)}_s${serverIndex}_suspended.png`,
-        );
-        try {
-          await page.screenshot({ path: shot, fullPage: true });
-        } catch {}
-        await sendTelegramMessage(
-          `🚨 <b>SUSPENDED</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${serverIndex} — renew manually NOW.`,
-          shot,
-        );
-        return "suspended";
-      }
-
-      console.log(
-        `   [Server ${serverIndex}] Renew button missing. URL: ${page.url()}`,
-      );
-      const shot = path.join(
-        ensureScreenshotDir(),
-        `${safeFilename(user.username)}_s${serverIndex}_unknown.png`,
-      );
-      try {
-        await page.screenshot({ path: shot, fullPage: true });
-      } catch {}
-      await sendTelegramMessage(
-        `⚠️ <b>Renew button missing</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${serverIndex}`,
-        shot,
-      );
-      return "unknown";
+      log(serverIndex, "Renew button not found, reloading");
+      await page.reload({ timeout: 15000 }).catch(() => {});
+      continue;
     }
 
-    await renewBtn.click();
-    console.log("   >> Renew clicked.");
+    await renewBtn.click({ timeout: 5000 }).catch(() => {});
+    log(serverIndex, "Renew clicked. Waiting for modal...");
 
     const modal = page.locator("#renew-modal");
     if (!(await isVisibleWithin(modal, 5000))) {
-      console.log("   >> Modal did not appear; retrying.");
+      modalRetries++;
+      if (modalRetries >= maxModalRetries) {
+        log(serverIndex, "Modal did not appear after max retries");
+        return { status: "modal-missing", attempts };
+      }
+      log(serverIndex, "Modal did not appear, reloading");
+      await page.reload({ timeout: 15000 }).catch(() => {});
       continue;
     }
 
-    try {
-      const box = await modal.boundingBox();
-      if (box)
-        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, {
-          steps: 5,
-        });
-    } catch {}
-
-    const tsResult = await ensureTurnstileSolved(page, modal);
+    const tsResult = await ensureTurnstileSolved(page, modal, serverIndex);
     if (tsResult === "timeout") {
-      console.log("   >> Turnstile failed in modal; reloading.");
-      await page.reload();
-      await page.waitForLoadState("domcontentloaded");
+      turnstileRetries++;
+      if (turnstileRetries >= maxTurnstileRetries) {
+        log(serverIndex, "Turnstile timeout after max retries");
+        return { status: "turnstile-timeout", attempts };
+      }
+      log(serverIndex, "Turnstile timeout, reloading");
+      await page.reload({ timeout: 15000 }).catch(() => {});
       continue;
-    }
-    if (tsResult === "no-widget") {
-      const modalCfDiv = await modal
-        .locator(".cf-turnstile")
-        .count()
-        .catch(() => 0);
-      const modalIframes = await modal
-        .locator("iframe")
-        .count()
-        .catch(() => 0);
-      console.log(
-        `   >> No Turnstile in modal (cf-turnstile=${modalCfDiv} iframes=${modalIframes}); trying Confirm directly.`,
-      );
     }
 
     const confirmBtn = modal.getByRole("button", { name: "Renew" });
-    if (!(await confirmBtn.isVisible().catch(() => false))) {
-      console.log("   >> Confirm button not visible; reloading.");
-      await page.reload();
-      await page.waitForLoadState("domcontentloaded");
+    if (!(await confirmBtn.isVisible({ timeout: 5000 }).catch(() => false))) {
+      log(serverIndex, "Confirm button not visible, reloading");
+      await page.reload({ timeout: 15000 }).catch(() => {});
       continue;
     }
 
-    const beforeShot = path.join(
-      ensureScreenshotDir(),
-      `${safeFilename(user.username)}_s${serverIndex}_attempt${attempt}.png`,
-    );
-    try {
-      await page.screenshot({ path: beforeShot, fullPage: true });
-    } catch {}
-
-    console.log("   >> Clicking Renew confirm...");
-    await confirmBtn.click();
+    log(serverIndex, "Clicking Renew confirm...");
+    await confirmBtn.click({ timeout: 5000 }).catch(() => {});
 
     let outcome = null;
-    const t0 = Date.now();
-    while (Date.now() - t0 < 3000) {
+    const checkStart = Date.now();
+    while (Date.now() - checkStart < 5000) {
       if (
         await page
           .getByText("Please complete the captcha to continue")
-          .isVisible()
+          .isVisible({ timeout: 1000 })
           .catch(() => false)
       ) {
         outcome = "captcha";
         break;
       }
       const notTimeLoc = page.getByText("You can't renew your server yet");
-      if (await notTimeLoc.isVisible().catch(() => false)) {
+      if (await notTimeLoc.isVisible({ timeout: 1000 }).catch(() => false)) {
         const text = await notTimeLoc.innerText().catch(() => "");
         const m = text.match(/as of\s+(.*?)\s+\(/);
-        console.log(`   >> Not renewable yet${m ? ": " + m[1] : ""}`);
+        log(serverIndex, `Not renewable yet: ${m ? m[1] : ""}`);
         outcome = "not-yet";
         break;
       }
-      await page.waitForTimeout(200);
+      await page.waitForTimeout(500);
     }
 
-    if (outcome === "not-yet") return "not-yet";
-
+    if (outcome === "not-yet") {
+      return { status: "not-yet", attempts };
+    }
     if (outcome === "captcha") {
-      console.log("   >> Captcha error; reloading.");
-      await page.reload();
-      await page.waitForLoadState("domcontentloaded");
+      log(serverIndex, "Captcha error after confirm, reloading");
+      await page.reload({ timeout: 15000 }).catch(() => {});
       continue;
     }
 
     await page.waitForTimeout(2000);
-    if (!(await modal.isVisible().catch(() => false))) {
-      console.log("   >> Renew succeeded.");
-      const shot = path.join(
-        ensureScreenshotDir(),
-        `${safeFilename(user.username)}_s${serverIndex}_success.png`,
-      );
-      try {
-        await page.screenshot({ path: shot, fullPage: true });
-      } catch {}
-      await sendTelegramMessage(
-        `✅ <b>Renewed</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${serverIndex}`,
-        shot,
-      );
-      return "success";
+    if (!(await modal.isVisible({ timeout: 2000 }).catch(() => false))) {
+      log(serverIndex, "Modal closed. Verifying success on dashboard...");
+      await page.goto(DASHBOARD_URL, { timeout: 15000 }).catch(() => {});
+      await waitForDashboard(page, 10000);
+
+      const dashboardBody = await page
+        .locator("body")
+        .innerText()
+        .catch(() => "");
+      const expiryMatch =
+        dashboardBody.match(
+          /(?:expires|valid until|renewal|next billing)[:\s]+([A-Za-z0-9\s,]+)/i,
+        ) ||
+        dashboardBody.match(/(\d{2}\/\d{2}\/\d{4})/) ||
+        dashboardBody.match(/(\d{4}-\d{2}-\d{2})/);
+      const expiryText = expiryMatch ? expiryMatch[0].trim() : null;
+
+      return {
+        status: expiryText ? "success" : "success-unverified",
+        expiry: expiryText,
+        attempts,
+      };
     }
 
-    console.log("   >> Modal still open, no error. Reloading.");
-    await page.reload();
-    await page.waitForLoadState("domcontentloaded");
+    log(serverIndex, "Modal still open, no error. Reloading...");
+    await page.reload({ timeout: 15000 }).catch(() => {});
   }
 
-  console.log(`   [Server ${serverIndex}] Exhausted.`);
-  const shot = path.join(
-    ensureScreenshotDir(),
-    `${safeFilename(user.username)}_s${serverIndex}_exhausted.png`,
-  );
-  try {
-    await page.screenshot({ path: shot, fullPage: true });
-  } catch {}
-  await sendTelegramMessage(
-    `❌ <b>Renewal exhausted</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${serverIndex}`,
-    shot,
-  );
-  return "exhausted";
+  return { status: "exhausted", attempts };
+}
+
+async function cleanupAndExit(code) {
+  clearTimeout(watchdogTimer);
+  if (browser) {
+    try {
+      await browser.close();
+    } catch {}
+  }
+  if (chromeProcess) {
+    try {
+      chromeProcess.kill("SIGKILL");
+    } catch {}
+  }
+  process.exit(code);
 }
 
 (async () => {
+  const startTime = Date.now();
   const users = getUsers();
   if (users.length === 0) {
-    console.error("No valid users. Exiting.");
-    process.exit(1);
+    log(undefined, "No valid users. Exiting.");
+    await cleanupAndExit(1);
   }
-
   if (PROXY_CONFIG && !(await checkProxy())) {
-    console.error("[Proxy] Invalid proxy. Exiting.");
-    process.exit(1);
+    log(undefined, "Invalid proxy. Exiting.");
+    await cleanupAndExit(1);
   }
 
   await launchChrome();
-
-  let browser;
   for (let k = 0; k < 5; k++) {
     try {
       browser = await chromium.connectOverCDP(`http://localhost:${DEBUG_PORT}`);
-      console.log("Connected.");
+      log(undefined, "Connected to Chrome.");
       break;
     } catch {
-      console.log(`Connection attempt ${k + 1} failed; retrying in 2s...`);
+      log(undefined, `Connection attempt ${k + 1} failed; retrying in 2s...`);
       await new Promise((r) => setTimeout(r, 2000));
     }
   }
   if (!browser) {
-    console.error("Failed to connect to Chrome. Exiting.");
-    process.exit(1);
+    log(undefined, "Failed to connect to Chrome. Exiting.");
+    await cleanupAndExit(1);
   }
 
   try {
@@ -722,11 +692,11 @@ async function renewCurrentServer(page, user, serverIndex) {
     }
 
     const summary = [];
-
     for (let i = 0; i < users.length; i++) {
       const user = users[i];
-      console.log(
-        `\n=== User ${i + 1}/${users.length}: ${redactUsername(user.username)} ===`,
+      log(
+        undefined,
+        `=== User ${i + 1}/${users.length}: ${redactUsername(user.username)} ===`,
       );
 
       try {
@@ -736,99 +706,212 @@ async function renewCurrentServer(page, user, serverIndex) {
         }
 
         const login = await loginToKatabump(page, user);
-        if (login !== "ok") {
+        if (login.status === "bad-creds") {
+          const shot = path.join(
+            ensureScreenshotDir(),
+            `${safeFilename(user.username)}_bad_creds.png`,
+          );
+          await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+          await sendTelegramMessage(
+            `❌ <b>Bad Credentials</b>\nUser: <code>${escapeHtml(user.username)}</code>\nAction: Update USERS_JSON`,
+            shot,
+          );
           summary.push({
             user: redactUsername(user.username),
-            result: `login:${login}`,
+            status: "bad-creds",
+            servers: [],
           });
+          finalExitCode = 1;
+          continue;
+        }
+        if (login.status !== "ok") {
+          const shot = path.join(
+            ensureScreenshotDir(),
+            `${safeFilename(user.username)}_login_failed.png`,
+          );
+          await page.screenshot({ path: shot, fullPage: true }).catch(() => {});
+          await sendTelegramMessage(
+            `❌ <b>Login Failed</b>\nUser: <code>${escapeHtml(user.username)}</code>`,
+            shot,
+          );
+          summary.push({
+            user: redactUsername(user.username),
+            status: "login-failed",
+            servers: [],
+          });
+          finalExitCode = 1;
           continue;
         }
 
         await page.waitForLoadState("domcontentloaded").catch(() => {});
         const ready = await waitForDashboard(page);
-
         if (!ready) {
           const body = await page
             .locator("body")
             .innerText()
             .catch(() => "");
-          console.log("No servers detected. URL:", page.url());
-          console.log("Body preview:", body.slice(0, 400).replace(/\s+/g, " "));
+          log(undefined, `No servers detected. URL: ${page.url()}`);
           summary.push({
             user: redactUsername(user.username),
-            result: "no-servers",
+            status: "no-servers",
+            servers: [],
           });
           continue;
         }
 
         const seeLinks = await findSeeLocator(page);
         const serverCount = await seeLinks.count();
-        console.log(`Found ${serverCount} server(s).`);
+        log(undefined, `Found ${serverCount} server(s).`);
 
         const serverResults = [];
         for (let s = 0; s < serverCount; s++) {
           if (s > 0) {
-            await page.goto(DASHBOARD_URL);
+            await page.goto(DASHBOARD_URL, { timeout: 15000 }).catch(() => {});
             await page.waitForLoadState("domcontentloaded").catch(() => {});
-            await waitForDashboard(page);
+            await waitForDashboard(page, 10000);
           }
+
           try {
             const fresh = await findSeeLocator(page);
-            await fresh.nth(s).click();
+            await fresh.nth(s).click({ timeout: 5000 });
             await page.waitForLoadState("domcontentloaded").catch(() => {});
             await page.waitForTimeout(1000);
           } catch (e) {
-            console.log(`   Could not open server ${s + 1}: ${e.message}`);
-            serverResults.push(`s${s + 1}:open-failed`);
+            log(s + 1, `Could not open server: ${e.message}`);
+            serverResults.push({
+              index: s + 1,
+              result: "open-failed",
+              attempts: 1,
+            });
             continue;
           }
+
+          const serverBody = await page
+            .locator("body")
+            .innerText()
+            .catch(() => "");
+          const expiryMatchBefore =
+            serverBody.match(
+              /(?:expires|valid until|renewal|next billing)[:\s]+([A-Za-z0-9\s,]+)/i,
+            ) ||
+            serverBody.match(/(\d{2}\/\d{2}\/\d{4})/) ||
+            serverBody.match(/(\d{4}-\d{2}-\d{2})/);
+          const expiryBefore = expiryMatchBefore
+            ? expiryMatchBefore[0].trim()
+            : null;
+
           const result = await renewCurrentServer(page, user, s + 1);
-          serverResults.push(`s${s + 1}:${result}`);
+
+          if (result.status === "suspended") {
+            const shot = path.join(
+              ensureScreenshotDir(),
+              `${safeFilename(user.username)}_s${s + 1}_suspended.png`,
+            );
+            await page
+              .screenshot({ path: shot, fullPage: true })
+              .catch(() => {});
+            await sendTelegramMessage(
+              `🚨 <b>SUSPENDED</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${s + 1} — renew manually NOW.`,
+              shot,
+            );
+            finalExitCode = 1;
+          } else if (
+            result.status === "captcha-exhausted" ||
+            result.status === "missing-renew-btn" ||
+            result.status === "modal-missing" ||
+            result.status === "turnstile-timeout"
+          ) {
+            const shot = path.join(
+              ensureScreenshotDir(),
+              `${safeFilename(user.username)}_s${s + 1}_${result.status}.png`,
+            );
+            await page
+              .screenshot({ path: shot, fullPage: true })
+              .catch(() => {});
+            await sendTelegramMessage(
+              `⚠️ <b>Server Action Failed</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${s + 1}\nReason: ${result.status}\nURL: ${result.url || "N/A"}`,
+              shot,
+            );
+            finalExitCode = 1;
+          }
+
+          serverResults.push({
+            index: s + 1,
+            result: result.status,
+            attempts: result.attempts,
+            expiryBefore,
+            expiryAfter: result.expiry || null,
+          });
         }
         summary.push({
           user: redactUsername(user.username),
-          result: serverResults.join(", "),
+          status: "processed",
+          servers: serverResults,
         });
       } catch (err) {
-        console.error(
-          `Error processing user ${redactUsername(user.username)}:`,
-          err.message,
+        log(
+          undefined,
+          `Error processing user ${redactUsername(user.username)}: ${err.message}`,
         );
         summary.push({
           user: redactUsername(user.username),
-          result: `error:${err.message}`,
+          status: `error:${err.message}`,
+          servers: [],
         });
+        finalExitCode = 1;
       } finally {
         try {
           if (page && !page.isClosed()) {
-            await page.screenshot({
-              path: path.join(
-                ensureScreenshotDir(),
-                `${safeFilename(user.username)}_final.png`,
-              ),
-              fullPage: true,
-            });
+            await page
+              .screenshot({
+                path: path.join(
+                  ensureScreenshotDir(),
+                  `${safeFilename(user.username)}_final.png`,
+                ),
+                fullPage: true,
+              })
+              .catch(() => {});
           }
         } catch {}
       }
     }
 
-    const hasFailure = summary.some((r) => !/success|not-yet/.test(r.result));
-    if (summary.length > 0 && (hasFailure || summary.length > 1)) {
-      const lines = summary.map(
-        (r) => `• <code>${escapeHtml(r.user)}</code> — ${escapeHtml(r.result)}`,
-      );
-      await sendTelegramMessage(
-        `<b>KataBump run summary</b>\n${lines.join("\n")}`,
-      );
+    const duration = Math.round((Date.now() - startTime) / 1000);
+    let runUrl = "";
+    if (
+      process.env.GITHUB_SERVER_URL &&
+      process.env.GITHUB_REPOSITORY &&
+      process.env.GITHUB_RUN_ID
+    ) {
+      runUrl = `\nRun: ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
     }
 
-    console.log("\nAll users processed.");
-  } finally {
-    if (browser) {
-      try {
-        if (typeof browser.close === "function") await browser.close();
-      } catch {}
+    let text = `<b>KataBump Renewal Summary</b>\nDuration: ${duration}s${runUrl}\n\n`;
+    for (const userSummary of summary) {
+      text += `<b>User:</b> <code>${escapeHtml(userSummary.user)}</code>\n`;
+      if (userSummary.status === "bad-creds") {
+        text += `  Result: Bad credentials\n`;
+      } else if (userSummary.status === "login-failed") {
+        text += `  Result: Login failed\n`;
+      } else if (userSummary.status === "no-servers") {
+        text += `  Result: No servers detected\n`;
+      } else {
+        for (const srv of userSummary.servers) {
+          text += `  Server ${srv.index}: ${escapeHtml(srv.result)}`;
+          if (srv.attempts) text += ` (${srv.attempts} attempts)`;
+          if (srv.expiryBefore)
+            text += `\n    Before: ${escapeHtml(srv.expiryBefore)}`;
+          if (srv.expiryAfter)
+            text += `\n    After: ${escapeHtml(srv.expiryAfter)}`;
+          text += `\n`;
+        }
+      }
+      text += `\n`;
     }
+
+    await sendTelegramMessage(text);
+    log(undefined, "All users processed.");
+  } finally {
+    await cleanupAndExit(finalExitCode);
   }
 })();
