@@ -69,6 +69,14 @@ function safeFilename(s) {
   return String(s).replace(/[^a-zA-Z0-9@._-]/g, "_");
 }
 
+function extractExpiry(text) {
+  const iso = text.match(/\b(20\d{2}-\d{2}-\d{2})\b/);
+  if (iso) return iso[1];
+  const slash = text.match(/\b(\d{2}\/\d{2}\/\d{4})\b/);
+  if (slash) return slash[1];
+  return null;
+}
+
 const SCREENSHOT_DIR = path.join(process.cwd(), "screenshots");
 function ensureScreenshotDir() {
   if (!fs.existsSync(SCREENSHOT_DIR))
@@ -536,7 +544,7 @@ async function waitForRenewOutcome(page, modal, timeoutMs) {
       .isVisible({ timeout: 500 })
       .catch(() => false);
     if (!modalVisible) {
-      return { status: "success", elapsed: Date.now() - start };
+      return { status: "modal-closed", elapsed: Date.now() - start };
     }
 
     const body = await page
@@ -569,6 +577,14 @@ async function waitForRenewOutcome(page, modal, timeoutMs) {
 }
 
 async function renewCurrentServer(page, user, serverIndex) {
+  const serverDetailUrl = page.url();
+  const pageBodyBefore = await page.locator("body").innerText().catch(() => "");
+  const expiryBefore = extractExpiry(pageBodyBefore);
+  log(
+    serverIndex,
+    `Captured: url=${serverDetailUrl} expiryBefore=${expiryBefore || "?"}`,
+  );
+
   let attempts = 0;
   const maxAttempts = 3;
   let modalRetries = 0;
@@ -588,12 +604,12 @@ async function renewCurrentServer(page, user, serverIndex) {
     if (notYetMatch) {
       const dateStr = notYetMatch[1].trim();
       log(serverIndex, `Not renewable until ${dateStr}`);
-      return { status: "not-yet", date: dateStr, attempts };
+      return { status: "not-yet", date: dateStr, expiryBefore, attempts };
     }
 
     if (/suspended/i.test(bodyText)) {
       log(serverIndex, "Server appears SUSPENDED");
-      return { status: "suspended", attempts };
+      return { status: "suspended", expiryBefore, attempts };
     }
 
     const renewBtn = page
@@ -605,7 +621,8 @@ async function renewCurrentServer(page, user, serverIndex) {
         return {
           status: "missing-renew-btn",
           url: page.url(),
-          excerpt: bodyText.slice(0, 200),
+          excerpt: bodyText.slice(0, 200).replace(/\s+/g, " "),
+          expiryBefore,
           attempts,
         };
       }
@@ -622,7 +639,7 @@ async function renewCurrentServer(page, user, serverIndex) {
       modalRetries++;
       if (modalRetries >= maxModalRetries) {
         log(serverIndex, "Modal did not appear after max retries");
-        return { status: "modal-missing", attempts };
+        return { status: "modal-missing", expiryBefore, attempts };
       }
       log(serverIndex, "Modal did not appear, reloading");
       await page.reload({ timeout: 15000 }).catch(() => {});
@@ -651,42 +668,77 @@ async function renewCurrentServer(page, user, serverIndex) {
     log(serverIndex, `Outcome: ${outcome.status} (${outcome.elapsed}ms)`);
 
     if (outcome.status === "not-yet") {
-      return { status: "not-yet", date: outcome.date, attempts };
+      return {
+        status: "not-yet",
+        date: outcome.date,
+        expiryBefore,
+        attempts,
+      };
     }
     if (outcome.status === "suspended") {
-      return { status: "suspended", attempts };
+      return { status: "suspended", expiryBefore, attempts };
     }
     if (outcome.status === "captcha" || outcome.status === "altcha-rejected") {
       log(serverIndex, `Captcha rejected (${outcome.status}), reloading`);
       await page.reload({ timeout: 15000 }).catch(() => {});
       continue;
     }
-    if (outcome.status === "success") {
-      log(serverIndex, "Modal closed. Verifying on dashboard...");
-      await page.goto(DASHBOARD_URL, { timeout: 15000 }).catch(() => {});
+    if (outcome.status === "modal-closed") {
+      log(serverIndex, "Modal closed. Navigating back to detail page to verify...");
+      await page.goto(serverDetailUrl, { timeout: 15000 }).catch(() => {});
       await page.waitForLoadState("domcontentloaded").catch(() => {});
+      await page.waitForTimeout(1500);
 
       if (page.url().includes("/auth/")) {
         log(serverIndex, "Session lost after renewal");
-        return { status: "session-lost", attempts };
+        return { status: "session-lost", expiryBefore, attempts };
       }
 
-      await waitForDashboard(page, 10000);
-      const dashboardBody = await page
+      const pageBodyAfter = await page
         .locator("body")
         .innerText()
         .catch(() => "");
-      const expiryMatch =
-        dashboardBody.match(
-          /(?:expires|valid until|renewal|next billing)[:\s]+([A-Za-z0-9\s,]+)/i,
-        ) ||
-        dashboardBody.match(/(\d{2}\/\d{2}\/\d{4})/) ||
-        dashboardBody.match(/(\d{4}-\d{2}-\d{2})/);
-      const expiryText = expiryMatch ? expiryMatch[0].trim() : null;
 
+      const notYetAfter = pageBodyAfter.match(
+        /You can't renew your server yet\.\s*You will be able to as of\s+([^(]+)/i,
+      );
+      if (notYetAfter) {
+        const dateStr = notYetAfter[1].trim();
+        log(serverIndex, `Modal closed but server says not-yet: ${dateStr}`);
+        return { status: "not-yet", date: dateStr, expiryBefore, attempts };
+      }
+
+      if (/suspended/i.test(pageBodyAfter)) {
+        log(serverIndex, "Server appears SUSPENDED after renewal");
+        return { status: "suspended", expiryBefore, attempts };
+      }
+
+      const expiryAfter = extractExpiry(pageBodyAfter);
+      log(
+        serverIndex,
+        `Post-renewal: expiryBefore=${expiryBefore || "?"} expiryAfter=${expiryAfter || "?"}`,
+      );
+
+      if (expiryBefore && expiryAfter && expiryAfter !== expiryBefore) {
+        log(serverIndex, `Verified: ${expiryBefore} → ${expiryAfter}`);
+        return {
+          status: "success",
+          expiryBefore,
+          expiryAfter,
+          attempts,
+        };
+      }
+
+      log(
+        serverIndex,
+        `Unverified: expiry did not change (${expiryBefore || "?"} vs ${expiryAfter || "?"})`,
+      );
       return {
-        status: expiryText ? "success" : "success-unverified",
-        expiry: expiryText,
+        status: "success-unverified",
+        expiryBefore,
+        expiryAfter,
+        url: page.url(),
+        excerpt: pageBodyAfter.slice(0, 300).replace(/\s+/g, " "),
         attempts,
       };
     }
@@ -695,7 +747,7 @@ async function renewCurrentServer(page, user, serverIndex) {
     await page.reload({ timeout: 15000 }).catch(() => {});
   }
 
-  return { status: "exhausted", attempts };
+  return { status: "exhausted", expiryBefore, attempts };
 }
 
 async function cleanupAndExit(code) {
@@ -712,6 +764,20 @@ async function cleanupAndExit(code) {
   }
   process.exit(code);
 }
+
+const STATUS_EMOJI = {
+  success: "✅",
+  "success-unverified": "⚠️",
+  "not-yet": "⏳",
+  suspended: "🚨",
+  exhausted: "❌",
+  "missing-renew-btn": "❌",
+  "modal-missing": "❌",
+  "session-lost": "❌",
+  "captcha-rejected": "❌",
+  "altcha-rejected": "❌",
+  "open-failed": "❌",
+};
 
 (async () => {
   const startTime = Date.now();
@@ -812,10 +878,6 @@ async function cleanupAndExit(code) {
         await page.waitForLoadState("domcontentloaded").catch(() => {});
         const ready = await waitForDashboard(page);
         if (!ready) {
-          const body = await page
-            .locator("body")
-            .innerText()
-            .catch(() => "");
           log(undefined, `No servers detected. URL: ${page.url()}`);
           summary.push({
             user: redactUsername(user.username),
@@ -848,23 +910,12 @@ async function cleanupAndExit(code) {
               index: s + 1,
               result: "open-failed",
               attempts: 1,
+              expiryBefore: null,
+              expiryAfter: null,
+              date: null,
             });
             continue;
           }
-
-          const serverBody = await page
-            .locator("body")
-            .innerText()
-            .catch(() => "");
-          const expiryMatchBefore =
-            serverBody.match(
-              /(?:expires|valid until|renewal|next billing)[:\s]+([A-Za-z0-9\s,]+)/i,
-            ) ||
-            serverBody.match(/(\d{2}\/\d{2}\/\d{4})/) ||
-            serverBody.match(/(\d{4}-\d{2}-\d{2})/);
-          const expiryBefore = expiryMatchBefore
-            ? expiryMatchBefore[0].trim()
-            : null;
 
           const result = await renewCurrentServer(page, user, s + 1);
 
@@ -888,6 +939,18 @@ async function cleanupAndExit(code) {
               shot,
             );
             finalExitCode = 1;
+          } else if (result.status === "success-unverified") {
+            const shot = path.join(
+              ensureScreenshotDir(),
+              `${safeFilename(user.username)}_s${s + 1}_unverified.png`,
+            );
+            await page
+              .screenshot({ path: shot, fullPage: true })
+              .catch(() => {});
+            await sendTelegramMessage(
+              `⚠️ <b>Unverified renewal</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${s + 1}\nModal closed but expiry unconfirmed.\nBefore: <code>${escapeHtml(result.expiryBefore || "?")}</code>\nAfter: <code>${escapeHtml(result.expiryAfter || "?")}</code>\nURL: ${escapeHtml(result.url || "")}\nExcerpt: ${escapeHtml(result.excerpt || "")}`,
+              shot,
+            );
           } else if (failureStatuses.has(result.status)) {
             const shot = path.join(
               ensureScreenshotDir(),
@@ -897,7 +960,7 @@ async function cleanupAndExit(code) {
               .screenshot({ path: shot, fullPage: true })
               .catch(() => {});
             await sendTelegramMessage(
-              `⚠️ <b>Server Action Failed</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${s + 1}\nReason: ${result.status}\nURL: ${result.url || "N/A"}`,
+              `❌ <b>Server Action Failed</b>\nUser: <code>${escapeHtml(user.username)}</code>\nServer ${s + 1}\nReason: <code>${result.status}</code>\nURL: ${escapeHtml(result.url || "")}`,
               shot,
             );
             finalExitCode = 1;
@@ -907,8 +970,9 @@ async function cleanupAndExit(code) {
             index: s + 1,
             result: result.status,
             attempts: result.attempts,
-            expiryBefore,
-            expiryAfter: result.expiry || null,
+            date: result.date || null,
+            expiryBefore: result.expiryBefore || null,
+            expiryAfter: result.expiryAfter || null,
           });
         }
         summary.push({
@@ -957,21 +1021,33 @@ async function cleanupAndExit(code) {
     let text = `<b>KataBump Renewal Summary</b>\nDuration: ${duration}s${runUrl}\n\n`;
     for (const userSummary of summary) {
       text += `<b>User:</b> <code>${escapeHtml(userSummary.user)}</code>\n`;
+
       if (userSummary.status === "bad-creds") {
-        text += `  Result: Bad credentials\n`;
+        text += `  ❌ Bad credentials\n`;
       } else if (userSummary.status === "login-failed") {
-        text += `  Result: Login failed\n`;
+        text += `  ❌ Login failed\n`;
       } else if (userSummary.status === "no-servers") {
-        text += `  Result: No servers detected\n`;
+        text += `  ℹ️ No servers detected\n`;
+      } else if (userSummary.status.startsWith("error:")) {
+        text += `  ❌ ${escapeHtml(userSummary.status.slice(6))}\n`;
       } else {
         for (const srv of userSummary.servers) {
-          text += `  Server ${srv.index}: ${escapeHtml(srv.result)}`;
-          if (srv.attempts) text += ` (${srv.attempts} attempts)`;
-          if (srv.expiryBefore)
-            text += `\n    Before: ${escapeHtml(srv.expiryBefore)}`;
-          if (srv.expiryAfter)
-            text += `\n    After: ${escapeHtml(srv.expiryAfter)}`;
+          const icon = STATUS_EMOJI[srv.result] || "❓";
+          text += `  ${icon} Server ${srv.index}: <code>${escapeHtml(srv.result)}</code>`;
+          if (srv.attempts > 1) text += ` (${srv.attempts} attempts)`;
           text += `\n`;
+
+          if (srv.result === "success") {
+            text += `     <b>Expiry:</b> ${escapeHtml(srv.expiryBefore || "?")} → ${escapeHtml(srv.expiryAfter || "?")}\n`;
+          } else if (srv.result === "not-yet") {
+            if (srv.date) text += `     <b>Available:</b> ${escapeHtml(srv.date)}\n`;
+            if (srv.expiryBefore) text += `     <b>Expiry:</b> ${escapeHtml(srv.expiryBefore)}\n`;
+          } else if (srv.result === "success-unverified") {
+            text += `     <b>Before:</b> ${escapeHtml(srv.expiryBefore || "?")}\n`;
+            text += `     <b>After:</b>  ${escapeHtml(srv.expiryAfter || "?")}\n`;
+          } else if (srv.result === "suspended") {
+            if (srv.expiryBefore) text += `     <b>Expiry:</b> ${escapeHtml(srv.expiryBefore)}\n`;
+          }
         }
       }
       text += `\n`;
